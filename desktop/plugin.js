@@ -264,8 +264,14 @@ function ActionCard({ ctx, actionId, streaming }) {
       setBody(result.card.body || '')
       setInfoRequest(result.card.metadata?.infoRequest || null)
       setError('')
-    } catch {
-      setError('This action card could not be loaded.')
+    } catch (loadError) {
+      const detail =
+        loadError instanceof Error ? loadError.message.slice(0, 180) : ''
+      setError(
+        detail
+          ? `This action card could not be loaded: ${detail}`
+          : 'This action card could not be loaded.'
+      )
     } finally {
       setLoading(false)
     }
