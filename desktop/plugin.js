@@ -70,9 +70,29 @@ function kindLabel(card) {
   if (card?.metadata?.channel === 'KEPLER_INFO_REQUEST') {
     return 'Vendor Info Request'
   }
+  if (card?.metadata?.channel === 'INTERCOM_VENDOR_EMAIL') {
+    return 'Vendor email via Intercom'
+  }
   return card?.kind === 'CUSTOMER_REPLY'
     ? 'Customer reply'
     : 'Vendor side conversation'
+}
+
+function approvalLabel(card) {
+  return {
+    INTERCOM_CUSTOMER_REPLY: 'Approve & send in Intercom',
+    INTERCOM_VENDOR_EMAIL: 'Approve & send vendor email',
+    KEPLER_INFO_REQUEST: 'Approve & create Info Request',
+    INTERCOM_SIDE_CONVERSATION: 'Approve vendor draft'
+  }[card?.metadata?.channel] || 'Approve'
+}
+
+function executionLabel(card) {
+  return {
+    INTERCOM_CUSTOMER_REPLY: 'Send reply in Intercom',
+    INTERCOM_VENDOR_EMAIL: 'Send vendor email',
+    KEPLER_INFO_REQUEST: 'Create & send Info Request'
+  }[card?.metadata?.channel] || 'Execute approved action'
 }
 
 const INFO_REQUEST_OPTIONS = {
@@ -401,13 +421,6 @@ function ActionCard({ ctx, actionId, streaming }) {
     }
   }
 
-  const approve = async () => {
-    const approved = await decide('APPROVE')
-    if (approved) {
-      host.notify({ kind: 'success', message: 'Action approved' })
-    }
-  }
-
   const reject = async () => {
     const rejected = await decide('REJECT', {
       reason: rejectReason.trim() || 'Rejected from Hermes Desktop'
@@ -444,27 +457,57 @@ function ActionCard({ ctx, actionId, streaming }) {
     }
   }
 
-  const executeInfoRequest = async () => {
-    if (!card || card.status !== 'APPROVED') return
+  const executeApproved = async approvedCard => {
+    if (!approvedCard || approvedCard.status !== 'APPROVED') return
     setWorking('execute')
     setError('')
     try {
-      const result = await ctx.rest(`/actions/${card.id}/execute`, {
+      const result = await ctx.rest(`/actions/${approvedCard.id}/execute`, {
         method: 'POST',
-        body: { expectedVersion: card.version }
+        body: { expectedVersion: approvedCard.version }
       })
       setCard(result.card)
+      const channel = result.execution.channel
       host.notify({
         kind: 'success',
-        message: `Info Request #${result.execution.threadId} sent to the vendor`
+        message:
+          channel === 'KEPLER_INFO_REQUEST'
+            ? `Info Request #${result.execution.threadId} sent to the vendor`
+            : channel === 'INTERCOM_VENDOR_EMAIL'
+              ? 'Vendor email sent through Intercom'
+              : 'Customer reply sent through Intercom'
       })
-    } catch {
+      return result.card
+    } catch (executeError) {
+      const detail =
+        executeError instanceof Error
+          ? executeError.message.slice(0, 180)
+          : ''
       setError(
-        'The Info Request was not confirmed. Its idempotency key prevents duplicate sends; retry safely.'
+        detail
+          ? `The approved action was not confirmed: ${detail}`
+          : 'The approved action was not confirmed. Retry safely.'
       )
+      return null
     } finally {
       setWorking('')
     }
+  }
+
+  const approve = async () => {
+    const approved = await decide('APPROVE')
+    if (!approved) return
+    if (
+      [
+        'INTERCOM_CUSTOMER_REPLY',
+        'INTERCOM_VENDOR_EMAIL',
+        'KEPLER_INFO_REQUEST'
+      ].includes(approved.metadata?.channel)
+    ) {
+      await executeApproved(approved)
+      return
+    }
+    host.notify({ kind: 'success', message: 'Action approved' })
   }
 
   if (!UUID_RE.test(actionId)) return null
@@ -658,7 +701,10 @@ function ActionCard({ ctx, actionId, streaming }) {
                     size: 'sm',
                     onClick: approve,
                     disabled: Boolean(working) || !body.trim(),
-                    children: working === 'APPROVE' ? 'Approving…' : 'Approve'
+                    children:
+                      working === 'APPROVE' || working === 'execute'
+                        ? 'Sending…'
+                        : approvalLabel(card)
                   })
                 : null,
               !finalState && card.status !== 'REJECTED'
@@ -675,8 +721,9 @@ function ActionCard({ ctx, actionId, streaming }) {
           jsxs('div', {
             style: rowStyle,
             children: [
-              ['APPROVED', 'COPIED'].includes(card.status)
-              && card.metadata?.channel !== 'KEPLER_INFO_REQUEST'
+              ['APPROVED', 'COPIED'].includes(card.status) &&
+              (card.metadata?.channel === 'INTERCOM_SIDE_CONVERSATION' ||
+                card.metadata?.channel === 'INTERCOM_CUSTOMER_REPLY')
                 ? jsx(Button, {
                     size: 'sm',
                     onClick: copyAndOpen,
@@ -687,20 +734,24 @@ function ActionCard({ ctx, actionId, streaming }) {
                         : 'Copy approved reply'
                   })
                 : null,
-              card.metadata?.channel === 'KEPLER_INFO_REQUEST' &&
+              [
+                'INTERCOM_CUSTOMER_REPLY',
+                'INTERCOM_VENDOR_EMAIL',
+                'KEPLER_INFO_REQUEST'
+              ].includes(card.metadata?.channel) &&
               card.status === 'APPROVED'
                 ? jsx(Button, {
                     size: 'sm',
-                    onClick: executeInfoRequest,
+                    onClick: () => executeApproved(card),
                     disabled: Boolean(working),
                     children:
                       working === 'execute'
                         ? 'Sending…'
-                        : 'Create & send Info Request'
+                        : executionLabel(card)
                   })
                 : null,
               card.kind === 'VENDOR_SIDE_CONVERSATION' &&
-              card.metadata?.channel !== 'KEPLER_INFO_REQUEST' &&
+              card.metadata?.channel === 'INTERCOM_SIDE_CONVERSATION' &&
               card.status === 'COPIED'
                 ? jsx(Button, {
                     size: 'sm',

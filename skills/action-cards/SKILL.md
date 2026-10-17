@@ -22,6 +22,12 @@ policies.
   `QUALITY_OR_DESCRIPTION_ISSUE` with verified order context.
 - Use a manual Intercom side-conversation card only when an Info Request is not an
   appropriate vendor workflow.
+- If the CS explicitly chooses an outbound Intercom email instead, set
+  `vendorChannel` to `INTERCOM_VENDOR_EMAIL`; the server resolves the matched vendor
+  contact without exposing the email address to the model.
+- Prepare every immediately useful parallel action in the first response. When
+  vendor input is needed, normally create both the customer holding/reply card and
+  the appropriate vendor card instead of waiting for a second user prompt.
 - A customer holding reply should simply confirm that The Oblist is checking with
   the relevant partner and will follow up. Do not expose internal uncertainty.
 - Vendor requests must contain only the questions relevant to that seller and the
