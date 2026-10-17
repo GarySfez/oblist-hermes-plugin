@@ -510,6 +510,7 @@ function ActionCard({ ctx, actionId, streaming }) {
             : null,
           jsx(Textarea, {
             value: body,
+            maxLength: infoRequest ? 4000 : 10000,
             rows: Math.min(14, Math.max(6, body.split('\n').length + 2)),
             disabled: !canEdit || Boolean(working),
             'aria-label': 'Editable message',
