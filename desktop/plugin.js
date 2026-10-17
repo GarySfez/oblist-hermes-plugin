@@ -66,16 +66,189 @@ function statusLabel(status) {
   }[status] || status
 }
 
-function kindLabel(kind) {
-  return kind === 'CUSTOMER_REPLY'
+function kindLabel(card) {
+  if (card?.metadata?.channel === 'KEPLER_INFO_REQUEST') {
+    return 'Vendor Info Request'
+  }
+  return card?.kind === 'CUSTOMER_REPLY'
     ? 'Customer reply'
     : 'Vendor side conversation'
+}
+
+const INFO_REQUEST_OPTIONS = {
+  PRODUCT: [
+    ['MISSING_DIMENSIONS', 'Missing dimensions'],
+    ['MISSING_MATERIALS', 'Materials not specified'],
+    ['MISSING_WEIGHT', 'Weight missing'],
+    ['WRONG_CATEGORY', 'Wrong product category'],
+    ['LOW_QUALITY_PHOTOS', 'Photos too low resolution'],
+    ['MISSING_LIFESTYLE', 'Need lifestyle photos'],
+    ['MISSING_DESCRIPTION', 'Description missing'],
+    ['PRICE_INCONSISTENT', 'Price seems inconsistent']
+  ],
+  VENDOR: [
+    ['MISSING_VAT', 'VAT number missing or invalid'],
+    ['MISSING_LOGO', 'Brand logo missing or low quality'],
+    ['MISSING_BRAND_DESC', 'Brand description missing'],
+    ['OUTDATED_ADDRESS', 'Address seems outdated'],
+    ['BRAND_HANDLE_ISSUE', 'Brand handle / URL issue'],
+    ['TERMS_REACCEPT', 'Re-accept updated terms']
+  ],
+  ORDER: [
+    ['REQUEST_SHIPPING_QUOTE', 'Request a shipping quote'],
+    ['MISSING_TRACKING', 'Tracking number missing'],
+    ['WRONG_TRACKING', 'Tracking number invalid'],
+    ['CONTACT_CARRIER_STATUS', 'Contact carrier for status'],
+    ['MISSING_INVOICE', 'Vendor invoice missing'],
+    ['SHIPPING_DELAYED', 'Shipping delayed'],
+    ['PACKAGING_PROOF', 'Send packaged-item photo'],
+    ['FULFILLMENT_CONFIRM', 'Confirm fulfillment status'],
+    [
+      'QUALITY_OR_DESCRIPTION_ISSUE',
+      'Damage, quality or description issue'
+    ]
+  ],
+  PENALTY: [
+    ['REJECTION_EXPLANATION', 'Explain rejection and prevention plan'],
+    ['REJECTION_STOCK_ACCURACY', 'Fix stock / catalogue accuracy'],
+    ['REJECTION_DAMAGE_QA', 'Damage — packaging / QA process'],
+    ['REJECTION_REPEATED_NOTICE', 'Repeated rejections — formal notice']
+  ],
+  PAYMENT: [
+    ['MISSING_IBAN', 'IBAN missing or invalid'],
+    ['STRIPE_CONNECT_ISSUE', 'Payment setup incomplete'],
+    ['PAYOUT_METHOD', 'Payout method needs update'],
+    ['BANKING_DOCS', 'Banking documents required']
+  ],
+  OTHER: []
+}
+
+function InfoRequestFields({ value, onChange, disabled }) {
+  if (!value?.sections?.length) return null
+
+  const toggle = (sectionIndex, itemId) => {
+    const sections = value.sections.map((section, index) => {
+      if (index !== sectionIndex) return section
+      const selected = new Set(section.items || [])
+      if (selected.has(itemId)) selected.delete(itemId)
+      else selected.add(itemId)
+      return { ...section, items: [...selected] }
+    })
+    const allSelected = sections.flatMap(section =>
+      (section.items || []).map(itemId => ({
+        category: section.category,
+        itemId
+      }))
+    )
+    const primaryStillSelected = allSelected.some(
+      item =>
+        item.category === value.primaryReason?.category &&
+        item.itemId === value.primaryReason?.itemId
+    )
+    onChange({
+      ...value,
+      sections,
+      primaryReason: primaryStillSelected
+        ? value.primaryReason
+        : allSelected[0] || null
+    })
+  }
+
+  return jsxs('div', {
+    style: {
+      display: 'grid',
+      gap: '10px',
+      padding: '10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '9px'
+    },
+    children: [
+      jsx('div', {
+        style: {
+          color: 'var(--ui-text-secondary)',
+          fontSize: '12px',
+          fontWeight: 650
+        },
+        children: 'Kepler Info Request details'
+      }),
+      ...value.sections.map((section, sectionIndex) => {
+        const options = INFO_REQUEST_OPTIONS[section.category] || []
+        const context = section.contextRef
+        const contextLabels =
+          context?.scope === 'all'
+            ? `All ${context.type}s`
+            : (context?.items || []).map(item => item.label).join(', ')
+        return jsxs('div', {
+          style: { display: 'grid', gap: '7px' },
+          children: [
+            jsxs('div', {
+              style: rowStyle,
+              children: [
+                jsx(Badge, { children: section.category }),
+                contextLabels
+                  ? jsx('span', {
+                      style: {
+                        color: 'var(--ui-text-tertiary)',
+                        fontSize: '12px'
+                      },
+                      children: contextLabels
+                    })
+                  : null
+              ]
+            }),
+            options.length
+              ? jsx('div', {
+                  style: {
+                    display: 'grid',
+                    gridTemplateColumns:
+                      'repeat(auto-fit, minmax(210px, 1fr))',
+                    gap: '6px'
+                  },
+                  children: options.map(([itemId, label]) =>
+                    jsxs('label', {
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '7px',
+                        minHeight: '32px',
+                        padding: '6px 8px',
+                        border: '1px solid var(--ui-stroke-secondary)',
+                        borderRadius: '7px',
+                        color: 'var(--ui-text-secondary)',
+                        fontSize: '12px',
+                        cursor: disabled ? 'default' : 'pointer'
+                      },
+                      children: [
+                        jsx('input', {
+                          type: 'checkbox',
+                          checked: (section.items || []).includes(itemId),
+                          disabled,
+                          onChange: () => toggle(sectionIndex, itemId)
+                        }),
+                        jsx('span', { children: label })
+                      ]
+                    })
+                  )
+                })
+              : jsx('span', {
+                  style: {
+                    color: 'var(--ui-text-tertiary)',
+                    fontSize: '12px'
+                  },
+                  children: 'Free-text request'
+                })
+          ]
+        })
+      })
+    ]
+  })
 }
 
 function ActionCard({ ctx, actionId, streaming }) {
   const [card, setCard] = useState(null)
   const [subject, setSubject] = useState('')
   const [body, setBody] = useState('')
+  const [infoRequest, setInfoRequest] = useState(null)
   const [loading, setLoading] = useState(true)
   const [working, setWorking] = useState('')
   const [error, setError] = useState('')
@@ -89,6 +262,7 @@ function ActionCard({ ctx, actionId, streaming }) {
       setCard(result.card)
       setSubject(result.card.subject || '')
       setBody(result.card.body || '')
+      setInfoRequest(result.card.metadata?.infoRequest || null)
       setError('')
     } catch {
       setError('This action card could not be loaded.')
@@ -111,9 +285,12 @@ function ActionCard({ ctx, actionId, streaming }) {
     () =>
       Boolean(
         card &&
-          ((card.subject || '') !== subject || (card.body || '') !== body)
+          ((card.subject || '') !== subject ||
+            (card.body || '') !== body ||
+            JSON.stringify(card.metadata?.infoRequest || null) !==
+              JSON.stringify(infoRequest))
       ),
-    [body, card, subject]
+    [body, card, infoRequest, subject]
   )
 
   const canEdit = card && ['DRAFT', 'APPROVED'].includes(card.status)
@@ -128,12 +305,14 @@ function ActionCard({ ctx, actionId, streaming }) {
         body: {
           expectedVersion: card.version,
           subject: subject.trim() || null,
-          body: body.trim()
+          body: body.trim(),
+          ...(infoRequest ? { infoRequest } : {})
         }
       })
       setCard(result.card)
       setSubject(result.card.subject || '')
       setBody(result.card.body || '')
+      setInfoRequest(result.card.metadata?.infoRequest || null)
       host.notify({ kind: 'success', message: 'Draft saved' })
       return result.card
     } catch {
@@ -217,6 +396,29 @@ function ActionCard({ ctx, actionId, streaming }) {
     }
   }
 
+  const executeInfoRequest = async () => {
+    if (!card || card.status !== 'APPROVED') return
+    setWorking('execute')
+    setError('')
+    try {
+      const result = await ctx.rest(`/actions/${card.id}/execute`, {
+        method: 'POST',
+        body: { expectedVersion: card.version }
+      })
+      setCard(result.card)
+      host.notify({
+        kind: 'success',
+        message: `Info Request #${result.execution.threadId} sent to the vendor`
+      })
+    } catch {
+      setError(
+        'The Info Request was not confirmed. Its idempotency key prevents duplicate sends; retry safely.'
+      )
+    } finally {
+      setWorking('')
+    }
+  }
+
   if (!UUID_RE.test(actionId)) return null
   if (streaming || loading) {
     return jsx('div', {
@@ -254,7 +456,7 @@ function ActionCard({ ctx, actionId, streaming }) {
 
   return jsxs('section', {
     style: cardStyle,
-    'aria-label': `${kindLabel(card.kind)} for ${card.recipientLabel}`,
+    'aria-label': `${kindLabel(card)} for ${card.recipientLabel}`,
     children: [
       jsxs('div', {
         style: headerStyle,
@@ -264,7 +466,7 @@ function ActionCard({ ctx, actionId, streaming }) {
             children: [
               jsx('strong', {
                 style: { fontSize: '13px', lineHeight: 1.35 },
-                children: kindLabel(card.kind)
+                children: kindLabel(card)
               }),
               jsx('span', {
                 style: {
@@ -297,6 +499,13 @@ function ActionCard({ ctx, actionId, streaming }) {
                 placeholder: 'Subject',
                 'aria-label': 'Message subject',
                 onChange: event => setSubject(event.target.value)
+              })
+            : null,
+          infoRequest
+            ? jsx(InfoRequestFields, {
+                value: infoRequest,
+                onChange: setInfoRequest,
+                disabled: !canEdit || Boolean(working)
               })
             : null,
           jsx(Textarea, {
@@ -418,6 +627,7 @@ function ActionCard({ ctx, actionId, streaming }) {
             style: rowStyle,
             children: [
               ['APPROVED', 'COPIED'].includes(card.status)
+              && card.metadata?.channel !== 'KEPLER_INFO_REQUEST'
                 ? jsx(Button, {
                     size: 'sm',
                     onClick: copyAndOpen,
@@ -428,7 +638,20 @@ function ActionCard({ ctx, actionId, streaming }) {
                         : 'Copy approved reply'
                   })
                 : null,
+              card.metadata?.channel === 'KEPLER_INFO_REQUEST' &&
+              card.status === 'APPROVED'
+                ? jsx(Button, {
+                    size: 'sm',
+                    onClick: executeInfoRequest,
+                    disabled: Boolean(working),
+                    children:
+                      working === 'execute'
+                        ? 'Sending…'
+                        : 'Create & send Info Request'
+                  })
+                : null,
               card.kind === 'VENDOR_SIDE_CONVERSATION' &&
+              card.metadata?.channel !== 'KEPLER_INFO_REQUEST' &&
               card.status === 'COPIED'
                 ? jsx(Button, {
                     size: 'sm',

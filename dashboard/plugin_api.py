@@ -81,6 +81,8 @@ async def edit_action(action_id: str, body: dict, request: Request):
         "body": body.get("body"),
         "actorRef": _actor_ref(request),
     }
+    if "infoRequest" in body:
+        payload["infoRequest"] = body["infoRequest"]
     return await asyncio.to_thread(
         _request_ai_ops,
         f"/v1/action-cards/{action_id}/edit",
@@ -104,6 +106,21 @@ async def decide_action(action_id: str, body: dict, request: Request):
     return await asyncio.to_thread(
         _request_ai_ops,
         f"/v1/action-cards/{action_id}/decision",
+        "POST",
+        payload,
+    )
+
+
+@router.post("/actions/{action_id}/execute")
+async def execute_action(action_id: str, body: dict, request: Request):
+    action_id = _validated_id(action_id)
+    payload = {
+        "expectedVersion": body.get("expectedVersion"),
+        "actorRef": _actor_ref(request),
+    }
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        f"/v1/action-cards/{action_id}/execute",
         "POST",
         payload,
     )

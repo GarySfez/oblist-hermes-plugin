@@ -14,6 +14,14 @@ policies.
 - Create one `CUSTOMER_REPLY` card for the customer-facing response.
 - Create one `VENDOR_SIDE_CONVERSATION` card per relevant seller when seller input
   is needed.
+- Prefer a Kepler Info Request when the request concerns an order, product,
+  production, shipment, tracking, invoice, payment or quality/non-conformity issue.
+  Populate `infoRequest` on the vendor card so the approved card can create the real
+  vendor dashboard thread and email. For damage, wrong dimensions, poor quality or
+  misdescription, use category `ORDER` and item
+  `QUALITY_OR_DESCRIPTION_ISSUE` with verified order context.
+- Use a manual Intercom side-conversation card only when an Info Request is not an
+  appropriate vendor workflow.
 - A customer holding reply should simply confirm that The Oblist is checking with
   the relevant partner and will follow up. Do not expose internal uncertainty.
 - Vendor requests must contain only the questions relevant to that seller and the
