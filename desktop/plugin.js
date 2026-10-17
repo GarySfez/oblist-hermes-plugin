@@ -123,6 +123,44 @@ const INFO_REQUEST_OPTIONS = {
   OTHER: []
 }
 
+function normalizeInfoRequest(value) {
+  if (!value?.sections?.length) return null
+  const sections = value.sections.map(section => {
+    const allowed = new Set(
+      (INFO_REQUEST_OPTIONS[section.category] || []).map(([id]) => id)
+    )
+    let items = (section.items || []).filter(item => allowed.has(item))
+    if (
+      items.length === 0 &&
+      section.category === 'ORDER' &&
+      /(dimension|damage|crack|quality|veneer|description|repair|replacement|refund)/i.test(
+        (section.items || []).join(' ')
+      )
+    ) {
+      items = ['QUALITY_OR_DESCRIPTION_ISSUE']
+    }
+    return { ...section, items }
+  })
+  const selected = sections.flatMap(section =>
+    (section.items || []).map(itemId => ({
+      category: section.category,
+      itemId
+    }))
+  )
+  const primaryStillSelected = selected.some(
+    item =>
+      item.category === value.primaryReason?.category &&
+      item.itemId === value.primaryReason?.itemId
+  )
+  return {
+    ...value,
+    sections,
+    primaryReason: primaryStillSelected
+      ? value.primaryReason
+      : selected[0] || null
+  }
+}
+
 function InfoRequestFields({ value, onChange, disabled }) {
   if (!value?.sections?.length) return null
 
@@ -262,7 +300,9 @@ function ActionCard({ ctx, actionId, streaming }) {
       setCard(result.card)
       setSubject(result.card.subject || '')
       setBody(result.card.body || '')
-      setInfoRequest(result.card.metadata?.infoRequest || null)
+      setInfoRequest(
+        normalizeInfoRequest(result.card.metadata?.infoRequest || null)
+      )
       setError('')
     } catch (loadError) {
       const detail =
@@ -318,7 +358,9 @@ function ActionCard({ ctx, actionId, streaming }) {
       setCard(result.card)
       setSubject(result.card.subject || '')
       setBody(result.card.body || '')
-      setInfoRequest(result.card.metadata?.infoRequest || null)
+      setInfoRequest(
+        normalizeInfoRequest(result.card.metadata?.infoRequest || null)
+      )
       host.notify({ kind: 'success', message: 'Draft saved' })
       return result.card
     } catch {
