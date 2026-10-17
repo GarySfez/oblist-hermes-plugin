@@ -771,6 +771,214 @@ function ActionCard({ ctx, actionId, streaming }) {
   })
 }
 
+function OperationsOverview({ ctx, streaming }) {
+  const [overview, setOverview] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const result = await ctx.rest('/overview', { timeoutMs: 60_000 })
+      setOverview(result)
+      setError('')
+    } catch (loadError) {
+      setError(
+        loadError instanceof Error
+          ? loadError.message.slice(0, 220)
+          : 'CS overview unavailable'
+      )
+    } finally {
+      setLoading(false)
+    }
+  }, [ctx])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  const resolveNow = async situation => {
+    const sessionId = host.state.focusedSessionId.get()
+    const prompt = [
+      `Résous maintenant cette situation CS : ${situation.id}.`,
+      situation.title,
+      situation.summary,
+      `Action recommandée : ${situation.nextAction}.`,
+      situation.orderNumber ? `Commande : #${situation.orderNumber}.` : '',
+      situation.conversationRef
+        ? `Conversation Intercom : ${situation.conversationRef}.`
+        : '',
+      'Récupère à nouveau le contexte live complet, vérifie les actions déjà effectuées, puis prépare toutes les cartes nécessaires sans envoyer avant mon approbation.'
+    ]
+      .filter(Boolean)
+      .join('\n')
+    const ok = await host.composer.setDraft(sessionId, prompt)
+    host.composer.focus(sessionId)
+    if (!ok) {
+      host.notify({
+        kind: 'error',
+        message: 'Could not prepare the resolution prompt'
+      })
+    }
+  }
+
+  if (streaming || loading) {
+    return jsx('section', {
+      style: cardStyle,
+      children: jsx('div', {
+        style: { padding: '14px', color: 'var(--ui-text-tertiary)' },
+        children: 'Building the global CS overview…'
+      })
+    })
+  }
+  if (!overview) {
+    return jsx('section', {
+      style: cardStyle,
+      children: jsxs('div', {
+        style: { ...rowStyle, padding: '12px 14px' },
+        children: [
+          jsx('span', {
+            style: { color: 'var(--ui-danger)', fontSize: '12px' },
+            children: error || 'Global CS overview unavailable.'
+          }),
+          jsx(Button, {
+            size: 'sm',
+            variant: 'secondary',
+            onClick: load,
+            children: 'Retry'
+          })
+        ]
+      })
+    })
+  }
+
+  return jsxs('section', {
+    style: { ...cardStyle, width: 'min(820px, 100%)' },
+    'aria-label': 'Global Customer Service priorities',
+    children: [
+      jsxs('div', {
+        style: headerStyle,
+        children: [
+          jsxs('div', {
+            style: { display: 'grid', gap: '3px' },
+            children: [
+              jsx('strong', {
+                style: { fontSize: '14px' },
+                children: 'Customer Service priorities'
+              }),
+              jsx('span', {
+                style: {
+                  color: 'var(--ui-text-tertiary)',
+                  fontSize: '12px'
+                },
+                children: `${overview.summary.supportOpen} open in Support · ${overview.summary.supportUnanswered} awaiting a reply`
+              })
+            ]
+          }),
+          jsx(Button, {
+            size: 'sm',
+            variant: 'secondary',
+            onClick: load,
+            children: 'Refresh'
+          })
+        ]
+      }),
+      jsx('div', {
+        style: {
+          ...bodyStyle,
+          gap: '8px',
+          maxHeight: '620px',
+          overflow: 'auto'
+        },
+        children:
+          overview.situations.length === 0
+            ? jsx('span', {
+                style: {
+                  color: 'var(--ui-text-tertiary)',
+                  fontSize: '13px'
+                },
+                children: 'No actionable situation found.'
+              })
+            : overview.situations.map(situation =>
+                jsxs('article', {
+                  style: {
+                    display: 'grid',
+                    gap: '8px',
+                    padding: '11px',
+                    border: '1px solid var(--ui-stroke-secondary)',
+                    borderRadius: '9px'
+                  },
+                  children: [
+                    jsxs('div', {
+                      style: {
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        justifyContent: 'space-between',
+                        gap: '10px'
+                      },
+                      children: [
+                        jsxs('div', {
+                          style: { display: 'grid', gap: '4px' },
+                          children: [
+                            jsx('strong', {
+                              style: { fontSize: '12px', lineHeight: 1.4 },
+                              children: situation.title
+                            }),
+                            jsx('span', {
+                              style: {
+                                color: 'var(--ui-text-secondary)',
+                                fontSize: '12px',
+                                lineHeight: 1.45
+                              },
+                              children: situation.summary
+                            })
+                          ]
+                        }),
+                        jsx(Badge, { children: situation.priority })
+                      ]
+                    }),
+                    jsx('span', {
+                      style: {
+                        color: 'var(--ui-text-tertiary)',
+                        fontSize: '11px'
+                      },
+                      children: situation.nextAction
+                    }),
+                    jsxs('div', {
+                      style: {
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        gap: '8px',
+                        flexWrap: 'wrap'
+                      },
+                      children: [
+                        jsx('div', {
+                          style: rowStyle,
+                          children: (situation.links || []).map(link =>
+                            jsx(Button, {
+                              size: 'sm',
+                              variant: 'secondary',
+                              onClick: () => ctx.os.openExternal(link.url),
+                              children: link.label
+                            })
+                          )
+                        }),
+                        jsx(Button, {
+                          size: 'sm',
+                          onClick: () => resolveNow(situation),
+                          children: 'Resolve now'
+                        })
+                      ]
+                    })
+                  ]
+                })
+              )
+      })
+    ]
+  })
+}
+
 export default {
   id: 'oblist-action-cards',
   name: 'The Oblist Action Cards',
@@ -786,6 +994,14 @@ export default {
             actionId: attrs.id || '',
             streaming
           })
+      }
+    })
+    ctx.register({
+      id: 'oblist-ops-overview-directive',
+      area: TRANSCRIPT_DIRECTIVE_AREA,
+      data: {
+        name: 'oblist-ops-overview',
+        render: ({ streaming }) => jsx(OperationsOverview, { ctx, streaming })
       }
     })
   }

@@ -44,7 +44,7 @@ def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) ->
         method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = "Action Card Gateway rejected the request"
@@ -69,6 +69,14 @@ async def get_action(action_id: str):
     return await asyncio.to_thread(
         _request_ai_ops,
         f"/v1/action-cards/{action_id}",
+    )
+
+
+@router.get("/overview")
+async def get_overview():
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        "/v1/cs-overview?limit=40",
     )
 
 
