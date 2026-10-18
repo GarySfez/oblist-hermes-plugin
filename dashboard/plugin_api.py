@@ -5,6 +5,7 @@ import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from fastapi import APIRouter, HTTPException, Request
@@ -63,6 +64,12 @@ def _validated_id(action_id: str) -> str:
     return action_id
 
 
+def _validated_operator(value: str) -> str:
+    if value not in {"", "lyse", "philippine"}:
+        raise HTTPException(status_code=400, detail="Invalid operator")
+    return value
+
+
 @router.get("/actions/{action_id}")
 async def get_action(action_id: str):
     action_id = _validated_id(action_id)
@@ -74,10 +81,8 @@ async def get_action(action_id: str):
 
 @router.get("/overview")
 async def get_overview(request: Request):
-    operator = request.query_params.get("operator", "")
+    operator = _validated_operator(request.query_params.get("operator", ""))
     view = request.query_params.get("view", "")
-    if operator not in {"", "lyse", "philippine"}:
-        raise HTTPException(status_code=400, detail="Invalid operator")
     allowed_views = {
         "",
         "MY_INBOX",
@@ -99,6 +104,46 @@ async def get_overview(request: Request):
     return await asyncio.to_thread(
         _request_ai_ops,
         f"/v1/cs-overview?{query}",
+    )
+
+
+@router.get("/notifications")
+async def get_notifications(request: Request):
+    operator = _validated_operator(request.query_params.get("operator", ""))
+    query = urllib.parse.urlencode(
+        {
+            **({"operatorRef": operator} if operator else {}),
+            "limit": "3",
+        }
+    )
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        f"/v1/desktop-notifications?{query}",
+    )
+
+
+@router.post("/notifications/{notification_id}/outcome")
+async def mark_notification(
+    notification_id: str,
+    body: dict,
+    request: Request,
+):
+    notification_id = _validated_id(notification_id)
+    operator = _validated_operator(request.query_params.get("operator", ""))
+    outcome = body.get("outcome")
+    if outcome not in {"DELIVERED", "RETRY"}:
+        raise HTTPException(status_code=400, detail="Invalid outcome")
+    payload = {
+        "outcome": outcome,
+        **({"operatorRef": operator} if operator else {}),
+    }
+    if isinstance(body.get("errorCode"), str):
+        payload["errorCode"] = body["errorCode"][:100]
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        f"/v1/desktop-notifications/{notification_id}/outcome",
+        "POST",
+        payload,
     )
 
 

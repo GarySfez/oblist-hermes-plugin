@@ -4,13 +4,17 @@ import {
   Input,
   Textarea,
   TRANSCRIPT_DIRECTIVE_AREA,
-  host
+  host,
+  useQuery,
+  useValue
 } from '@hermes/plugin-sdk'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+const inFlightNotificationIds = new Set()
 
 const cardStyle = {
   width: 'min(720px, 100%)',
@@ -780,6 +784,69 @@ const CS_VIEW_OPTIONS = [
   ['SHIPPING_QUOTE', 'Shipping quotes']
 ]
 
+function resolutionPrompt(situation) {
+  return [
+    `Résous maintenant cette situation CS : ${situation.id}.`,
+    situation.title,
+    situation.summary,
+    `Action recommandée : ${situation.nextAction}.`,
+    situation.orderNumber ? `Commande : #${situation.orderNumber}.` : '',
+    situation.conversationRef
+      ? `Conversation Intercom : ${situation.conversationRef}.`
+      : '',
+    'Récupère à nouveau le contexte live complet, vérifie les actions déjà effectuées, puis prépare toutes les cartes nécessaires sans envoyer avant mon approbation.'
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+async function openSituationChat(situation, profile) {
+  const prompt = resolutionPrompt(situation)
+  const title = `CS · ${situation.id}`.slice(0, 180)
+  try {
+    const listed = await host.request('session.list', {
+      title,
+      ...(profile ? { profile } : {})
+    })
+    const existing = listed?.sessions?.[0]
+    let session
+    if (existing) {
+      session = await host.request('session.resume', {
+        session_id: existing.resolved_id || existing.id,
+        defer_history: true,
+        ...(profile ? { profile } : {})
+      })
+    } else {
+      session = await host.request('session.create', {
+        title,
+        idempotency_key: `cs-situation:${situation.id}`,
+        follow_profile_config: true,
+        ...(profile ? { profile } : {})
+      })
+    }
+    const runtimeId = session?.session_id
+    const storedId =
+      session?.stored_session_id || existing?.resolved_id || existing?.id
+    if (!runtimeId || !storedId) throw new Error('Session creation failed')
+    await host.request('prompt.submit', {
+      session_id: runtimeId,
+      text: prompt
+    })
+    host.navigate(`/${encodeURIComponent(storedId)}`)
+    return true
+  } catch {
+    const sessionId = host.state.focusedSessionId.get()
+    const ok = await host.composer.setDraft(sessionId, prompt)
+    host.composer.focus(sessionId)
+    if (ok) return true
+    host.notify({
+      kind: 'error',
+      message: 'Could not open the dedicated resolution chat'
+    })
+    return false
+  }
+}
+
 function OperationsOverview({
   ctx,
   streaming,
@@ -822,66 +889,11 @@ function OperationsOverview({
   }, [load])
 
   const resolveNow = async situation => {
-    const prompt = [
-      `Résous maintenant cette situation CS : ${situation.id}.`,
-      situation.title,
-      situation.summary,
-      `Action recommandée : ${situation.nextAction}.`,
-      situation.orderNumber ? `Commande : #${situation.orderNumber}.` : '',
-      situation.conversationRef
-        ? `Conversation Intercom : ${situation.conversationRef}.`
-        : '',
-      'Récupère à nouveau le contexte live complet, vérifie les actions déjà effectuées, puis prépare toutes les cartes nécessaires sans envoyer avant mon approbation.'
-    ]
-      .filter(Boolean)
-      .join('\n')
     const profile =
       overview.scope?.operatorRef ||
       host.state.focusedSessionProfile.get() ||
       undefined
-    const title = `CS · ${situation.id}`.slice(0, 180)
-    try {
-      const listed = await host.request('session.list', {
-        title,
-        ...(profile ? { profile } : {})
-      })
-      const existing = listed?.sessions?.[0]
-      let session
-      if (existing) {
-        session = await host.request('session.resume', {
-          session_id: existing.resolved_id || existing.id,
-          defer_history: true,
-          ...(profile ? { profile } : {})
-        })
-      } else {
-        session = await host.request('session.create', {
-          title,
-          idempotency_key: `cs-situation:${situation.id}`,
-          follow_profile_config: true,
-          ...(profile ? { profile } : {})
-        })
-      }
-      const runtimeId = session?.session_id
-      const storedId =
-        session?.stored_session_id ||
-        existing?.resolved_id ||
-        existing?.id
-      if (!runtimeId || !storedId) throw new Error('Session creation failed')
-      await host.request('prompt.submit', {
-        session_id: runtimeId,
-        text: prompt
-      })
-      host.navigate(`/${encodeURIComponent(storedId)}`)
-    } catch {
-      const sessionId = host.state.focusedSessionId.get()
-      const ok = await host.composer.setDraft(sessionId, prompt)
-      host.composer.focus(sessionId)
-      if (ok) return
-      host.notify({
-        kind: 'error',
-        message: 'Could not open the dedicated resolution chat'
-      })
-    }
+    await openSituationChat(situation, profile)
   }
 
   if (streaming || loading) {
@@ -1059,10 +1071,116 @@ function OperationsOverview({
   })
 }
 
+function NotificationPoller({ ctx }) {
+  const focusedProfile = useValue(host.state.focusedSessionProfile)
+  const homeProfile = useValue(host.state.profile)
+  const profile = focusedProfile || homeProfile || ''
+  const operator =
+    profile === 'lyse' || profile === 'philippine' ? profile : ''
+
+  const { data } = useQuery({
+    queryKey: ['oblist-action-cards', 'notifications', operator],
+    queryFn: () => {
+      const query = operator
+        ? `?operator=${encodeURIComponent(operator)}`
+        : ''
+      return ctx.rest(`/notifications${query}`, { timeoutMs: 20_000 })
+    },
+    refetchInterval: 30_000,
+    refetchOnWindowFocus: true,
+    retry: 2
+  })
+
+  useEffect(() => {
+    const notifications = Array.isArray(data?.notifications)
+      ? data.notifications
+      : []
+    if (notifications.length === 0) return undefined
+
+    let cancelled = false
+    const deliver = async () => {
+      for (const notification of notifications) {
+        if (
+          cancelled ||
+          !UUID_RE.test(notification?.id || '') ||
+          inFlightNotificationIds.has(notification.id)
+        ) {
+          continue
+        }
+        inFlightNotificationIds.add(notification.id)
+        const situation = notification?.payload?.situation
+        try {
+          if (!situation?.id) throw new Error('INVALID_SITUATION_PAYLOAD')
+          const resolve = () =>
+            openSituationChat(situation, operator || profile || undefined)
+          host.notify({
+            kind: 'info',
+            message: `${notification.title} · ${notification.body}`
+          })
+          await ctx.os.notify({
+            title: notification.title,
+            body: notification.body,
+            onActivate: resolve,
+            actions: [
+              {
+                id: 'resolve-now',
+                label: 'Resolve now',
+                onAction: resolve
+              }
+            ]
+          })
+          const query = operator
+            ? `?operator=${encodeURIComponent(operator)}`
+            : ''
+          await ctx.rest(
+            `/notifications/${notification.id}/outcome${query}`,
+            {
+              method: 'POST',
+              body: { outcome: 'DELIVERED' },
+              timeoutMs: 20_000
+            }
+          )
+        } catch (deliveryError) {
+          const query = operator
+            ? `?operator=${encodeURIComponent(operator)}`
+            : ''
+          await ctx
+            .rest(`/notifications/${notification.id}/outcome${query}`, {
+              method: 'POST',
+              body: {
+                outcome: 'RETRY',
+                errorCode:
+                  deliveryError instanceof Error
+                    ? deliveryError.message.slice(0, 100)
+                    : 'DESKTOP_DELIVERY_FAILED'
+              },
+              timeoutMs: 20_000
+            })
+            .catch(() => undefined)
+        } finally {
+          inFlightNotificationIds.delete(notification.id)
+        }
+      }
+    }
+    void deliver()
+    return () => {
+      cancelled = true
+    }
+  }, [ctx, data, operator, profile])
+
+  return null
+}
+
 export default {
   id: 'oblist-action-cards',
   name: 'The Oblist Action Cards',
   register(ctx) {
+    ctx.register({
+      id: 'oblist-proactive-notification-poller',
+      area: 'statusBar.right',
+      order: 10_000,
+      render: () => jsx(NotificationPoller, { ctx })
+    })
     ctx.register({
       id: 'oblist-action-card-directive',
       area: TRANSCRIPT_DIRECTIVE_AREA,
