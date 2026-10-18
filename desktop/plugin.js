@@ -3,6 +3,7 @@ import {
   Badge,
   Button,
   Codicon,
+  COMPOSER_AREAS,
   Input,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
@@ -1241,6 +1242,73 @@ function NotificationStatus({ ctx }) {
   })
 }
 
+function NotificationBanner() {
+  const inbox = useValue(notificationInboxAtom)
+  const focusedProfile = useValue(host.state.focusedSessionProfile)
+  const homeProfile = useValue(host.state.profile)
+  const currentOperator =
+    focusedProfile === 'lyse' || focusedProfile === 'philippine'
+      ? focusedProfile
+      : homeProfile === 'lyse' || homeProfile === 'philippine'
+        ? homeProfile
+        : ''
+  const count =
+    inbox.operator === currentOperator ? inbox.notifications.length : 0
+
+  if (count === 0) return null
+  return jsxs('button', {
+    type: 'button',
+    onClick: () => host.navigate('/oblist-notifications'),
+    style: {
+      width: '100%',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '10px',
+      padding: '8px 10px',
+      border: '1px solid var(--ui-danger)',
+      borderRadius: '9px',
+      background: 'var(--ui-bg-secondary)',
+      color: 'var(--ui-text-primary)',
+      cursor: 'pointer',
+      fontSize: '12px'
+    },
+    children: [
+      jsxs('span', {
+        style: {
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '8px',
+          minWidth: 0
+        },
+        children: [
+          jsx('span', {
+            'aria-hidden': true,
+            style: {
+              width: '8px',
+              height: '8px',
+              flex: '0 0 auto',
+              borderRadius: '999px',
+              background: 'var(--ui-danger)'
+            }
+          }),
+          jsx('strong', {
+            children: `${count} nouvelle${count > 1 ? 's' : ''} alerte${count > 1 ? 's' : ''} CS`
+          })
+        ]
+      }),
+      jsx('span', {
+        style: {
+          color: 'var(--ui-accent)',
+          fontWeight: 700,
+          whiteSpace: 'nowrap'
+        },
+        children: 'Open alerts →'
+      })
+    ]
+  })
+}
+
 function NotificationInboxPage({ ctx }) {
   const inbox = useValue(notificationInboxAtom)
   const [working, setWorking] = useState('')
@@ -1499,6 +1567,12 @@ export default {
       area: STATUSBAR_AREAS.right,
       order: 70,
       render: () => jsx(NotificationStatus, { ctx })
+    })
+    ctx.register({
+      id: 'oblist-notification-banner',
+      area: COMPOSER_AREAS.top,
+      order: 10,
+      render: () => jsx(NotificationBanner, {})
     })
     ctx.register({
       id: 'oblist-action-card-directive',
