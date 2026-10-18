@@ -822,7 +822,6 @@ function OperationsOverview({
   }, [load])
 
   const resolveNow = async situation => {
-    const sessionId = host.state.focusedSessionId.get()
     const prompt = [
       `Résous maintenant cette situation CS : ${situation.id}.`,
       situation.title,
@@ -836,12 +835,51 @@ function OperationsOverview({
     ]
       .filter(Boolean)
       .join('\n')
-    const ok = await host.composer.setDraft(sessionId, prompt)
-    host.composer.focus(sessionId)
-    if (!ok) {
+    const profile =
+      overview.scope?.operatorRef ||
+      host.state.focusedSessionProfile.get() ||
+      undefined
+    const title = `CS · ${situation.id}`.slice(0, 180)
+    try {
+      const listed = await host.request('session.list', {
+        title,
+        ...(profile ? { profile } : {})
+      })
+      const existing = listed?.sessions?.[0]
+      let session
+      if (existing) {
+        session = await host.request('session.resume', {
+          session_id: existing.resolved_id || existing.id,
+          defer_history: true,
+          ...(profile ? { profile } : {})
+        })
+      } else {
+        session = await host.request('session.create', {
+          title,
+          idempotency_key: `cs-situation:${situation.id}`,
+          follow_profile_config: true,
+          ...(profile ? { profile } : {})
+        })
+      }
+      const runtimeId = session?.session_id
+      const storedId =
+        session?.stored_session_id ||
+        existing?.resolved_id ||
+        existing?.id
+      if (!runtimeId || !storedId) throw new Error('Session creation failed')
+      await host.request('prompt.submit', {
+        session_id: runtimeId,
+        text: prompt
+      })
+      host.navigate(`/${encodeURIComponent(storedId)}`)
+    } catch {
+      const sessionId = host.state.focusedSessionId.get()
+      const ok = await host.composer.setDraft(sessionId, prompt)
+      host.composer.focus(sessionId)
+      if (ok) return
       host.notify({
         kind: 'error',
-        message: 'Could not prepare the resolution prompt'
+        message: 'Could not open the dedicated resolution chat'
       })
     }
   }
