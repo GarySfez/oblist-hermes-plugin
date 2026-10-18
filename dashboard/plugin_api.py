@@ -25,6 +25,23 @@ _OPERATOR_BY_EMAIL = {
 _IDENTITY_CACHE: dict[str, tuple[float, str]] = {}
 
 
+def _configured_identity_map() -> dict[str, str]:
+    raw = os.environ.get("OBLIST_HERMES_IDENTITY_MAP", "")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        str(user_id).strip(): str(email).strip().lower()
+        for user_id, email in parsed.items()
+        if str(user_id).strip() and str(email).strip()
+    }
+
+
 def _actor_ref(request: Request) -> str:
     session = getattr(request.state, "session", None)
     user_id = str(getattr(session, "user_id", "") or "").strip()
@@ -42,6 +59,13 @@ def _session_email(request: Request) -> str:
     cached = _IDENTITY_CACHE.get(user_id)
     if cached and cached[0] > time.time():
         return cached[1]
+    configured_email = _configured_identity_map().get(user_id)
+    if configured_email:
+        _IDENTITY_CACHE[user_id] = (
+            time.time() + 300,
+            configured_email,
+        )
+        return configured_email
     access_token = str(getattr(session, "access_token", "") or "").strip()
     if not access_token:
         raise HTTPException(status_code=401, detail="Authenticated email required")
