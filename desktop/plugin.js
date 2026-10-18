@@ -824,6 +824,7 @@ function resolutionPrompt(situation) {
 async function openSituationChat(situation, profile) {
   const prompt = resolutionPrompt(situation)
   const title = `CS · ${situation.id}`.slice(0, 180)
+  const testOnly = (situation.signals || []).includes('TEST_ONLY')
   try {
     const listed = await host.request('session.list', {
       title,
@@ -842,6 +843,11 @@ async function openSituationChat(situation, profile) {
         title,
         idempotency_key: `cs-situation:${situation.id}`,
         follow_profile_config: true,
+        model: testOnly
+          ? 'anthropic/claude-haiku-5.5'
+          : 'anthropic/claude-sonnet-5.5',
+        provider: 'nous',
+        reasoning_effort: testOnly ? 'low' : 'medium',
         ...(profile ? { profile } : {})
       })
     }

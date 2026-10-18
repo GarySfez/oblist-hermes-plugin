@@ -16,6 +16,11 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+_ADMIN_EMAILS = {"garysfez@oblist.com"}
+_OPERATOR_BY_EMAIL = {
+    "lyse@oblist.com": "lyse",
+    "philippine@oblist.com": "philippine",
+}
 
 
 def _actor_ref(request: Request) -> str:
@@ -24,6 +29,33 @@ def _actor_ref(request: Request) -> str:
     if not user_id:
         raise HTTPException(status_code=401, detail="Authenticated user required")
     return user_id[:300]
+
+
+def _session_email(request: Request) -> str:
+    session = getattr(request.state, "session", None)
+    email = str(getattr(session, "email", "") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=401, detail="Authenticated email required")
+    return email
+
+
+def _authorized_operator(request: Request, requested: str) -> str:
+    requested = _validated_operator(requested)
+    email = _session_email(request)
+    if email in _ADMIN_EMAILS:
+        return requested
+    operator = _OPERATOR_BY_EMAIL.get(email)
+    if not operator:
+        raise HTTPException(status_code=403, detail="Operator access denied")
+    if requested and requested != operator:
+        raise HTTPException(status_code=403, detail="Cross-profile access denied")
+    return operator
+
+
+def _require_oblist_operator(request: Request) -> None:
+    email = _session_email(request)
+    if email not in _ADMIN_EMAILS and email not in _OPERATOR_BY_EMAIL:
+        raise HTTPException(status_code=403, detail="Operator access denied")
 
 
 def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) -> dict:
@@ -71,7 +103,8 @@ def _validated_operator(value: str) -> str:
 
 
 @router.get("/actions/{action_id}")
-async def get_action(action_id: str):
+async def get_action(action_id: str, request: Request):
+    _require_oblist_operator(request)
     action_id = _validated_id(action_id)
     return await asyncio.to_thread(
         _request_ai_ops,
@@ -81,7 +114,10 @@ async def get_action(action_id: str):
 
 @router.get("/overview")
 async def get_overview(request: Request):
-    operator = _validated_operator(request.query_params.get("operator", ""))
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
     view = request.query_params.get("view", "")
     allowed_views = {
         "",
@@ -109,7 +145,10 @@ async def get_overview(request: Request):
 
 @router.get("/notifications")
 async def get_notifications(request: Request):
-    operator = _validated_operator(request.query_params.get("operator", ""))
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
     query = urllib.parse.urlencode(
         {
             **({"operatorRef": operator} if operator else {}),
@@ -124,7 +163,10 @@ async def get_notifications(request: Request):
 
 @router.get("/notification-inbox")
 async def get_notification_inbox(request: Request):
-    operator = _validated_operator(request.query_params.get("operator", ""))
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
     query = urllib.parse.urlencode(
         {
             **({"operatorRef": operator} if operator else {}),
@@ -144,7 +186,10 @@ async def mark_notification(
     request: Request,
 ):
     notification_id = _validated_id(notification_id)
-    operator = _validated_operator(request.query_params.get("operator", ""))
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
     outcome = body.get("outcome")
     if outcome not in {"DELIVERED", "RETRY"}:
         raise HTTPException(status_code=400, detail="Invalid outcome")
@@ -168,7 +213,10 @@ async def mark_notification_read(
     request: Request,
 ):
     notification_id = _validated_id(notification_id)
-    operator = _validated_operator(request.query_params.get("operator", ""))
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
     payload = {
         "actorRef": _actor_ref(request),
         **({"operatorRef": operator} if operator else {}),
@@ -183,6 +231,7 @@ async def mark_notification_read(
 
 @router.post("/actions/{action_id}/edit")
 async def edit_action(action_id: str, body: dict, request: Request):
+    _require_oblist_operator(request)
     action_id = _validated_id(action_id)
     payload = {
         "expectedVersion": body.get("expectedVersion"),
@@ -202,6 +251,7 @@ async def edit_action(action_id: str, body: dict, request: Request):
 
 @router.post("/actions/{action_id}/decision")
 async def decide_action(action_id: str, body: dict, request: Request):
+    _require_oblist_operator(request)
     action_id = _validated_id(action_id)
     payload = {
         "expectedVersion": body.get("expectedVersion"),
@@ -222,6 +272,7 @@ async def decide_action(action_id: str, body: dict, request: Request):
 
 @router.post("/actions/{action_id}/execute")
 async def execute_action(action_id: str, body: dict, request: Request):
+    _require_oblist_operator(request)
     action_id = _validated_id(action_id)
     payload = {
         "expectedVersion": body.get("expectedVersion"),
