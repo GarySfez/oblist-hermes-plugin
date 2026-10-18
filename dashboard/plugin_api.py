@@ -76,6 +76,7 @@ def _release_contract() -> dict:
         "memoryApiVersion",
         "workerVersion",
         "pluginVersion",
+        "manifestDigestEnv",
     }
     if (
         not isinstance(contract, dict)
@@ -89,6 +90,21 @@ def _release_contract() -> dict:
         or not re.fullmatch(r"sha256:[a-f0-9]{64}", digest)
     ):
         raise RuntimeError("Plugin manifest digest is invalid")
+    if contract.get("manifestDigestEnv") != "OBLIST_HERMES_MANIFEST_DIGEST":
+        raise RuntimeError("Plugin manifest digest source is invalid")
+    configured_digest = os.environ.get(
+        "OBLIST_HERMES_MANIFEST_DIGEST",
+        "",
+    ).strip()
+    if configured_digest:
+        if not re.fullmatch(r"sha256:[a-f0-9]{64}", configured_digest):
+            raise RuntimeError(
+                "Configured plugin manifest digest is invalid"
+            )
+        contract = {
+            **contract,
+            "manifestDigest": configured_digest,
+        }
     return contract
 
 

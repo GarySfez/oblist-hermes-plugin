@@ -80,6 +80,19 @@ function currentConnectionKey() {
   )
 }
 
+function currentProfileKey() {
+  const focusedSessionId = host.state.focusedSessionId.get()
+  const focusedProfile = host.state.focusedSessionProfile.get()
+  const homeProfile = host.state.profile.get()
+  return String(
+    (
+      focusedSessionId
+        ? focusedProfile
+        : homeProfile || focusedProfile
+    ) || 'global'
+  )
+}
+
 function normalizeRuntimeHandshake(value) {
   const nested =
     value?.runtime && typeof value.runtime === 'object'
@@ -863,7 +876,7 @@ function InfoRequestFields({ value, onChange, disabled }) {
 
 function ActionCard({ ctx, actionId, streaming }) {
   const runtime = useRuntimeCompatibility(ctx)
-  const actionCacheKey = `${currentConnectionKey()}:${actionId}`
+  const actionCacheKey = `${currentConnectionKey()}:${currentProfileKey()}:${actionId}`
   const cachedAction = actionCardCache.get(actionCacheKey)?.card || null
   const [card, setCard] = useState(cachedAction)
   const [subject, setSubject] = useState(cachedAction?.subject || '')
@@ -2135,7 +2148,7 @@ function OperationsOverview({
     initialView ||
     (operatorRef ? 'MY_INBOX' : 'TEAM_SUPPORT')
   const [activeView, setActiveView] = useState(defaultView)
-  const cacheKey = `${currentConnectionKey()}:${
+  const cacheKey = `${currentConnectionKey()}:${currentProfileKey()}:${
     operatorRef || 'global'
   }:${activeView}`
   const initialCache = operationsOverviewCache.get(cacheKey)
@@ -2411,9 +2424,15 @@ function OperationsOverview({
 }
 
 function currentNotificationScope() {
+  const focusedSessionId = host.state.focusedSessionId.get()
   const focusedProfile = host.state.focusedSessionProfile.get()
   const homeProfile = host.state.profile.get()
-  const profile = homeProfile || focusedProfile || ''
+  const profile =
+    (
+      focusedSessionId
+        ? focusedProfile
+        : homeProfile || focusedProfile
+    ) || ''
   const operator =
     profile === 'lyse' || profile === 'philippine' ? profile : ''
   return { profile, operator }
@@ -2555,10 +2574,8 @@ async function pollDesktopNotifications(ctx) {
       try {
         const resolve = async () => {
           await claimNotificationWatch(ctx, notification)
-          return openSituationChat(
-            situation,
-            operator || profile || undefined
-          )
+          host.navigate('/oblist-notifications')
+          return true
         }
         host.notify({
           kind: 'info',
@@ -2813,11 +2830,6 @@ function NotificationInboxPage({ ctx }) {
     setError('')
     try {
       await claimNotificationWatch(ctx, notification)
-      await readNotification(ctx, notification.id)
-      await openSituationChat(
-        situation,
-        operator || profile || undefined
-      )
     } catch (resolveError) {
       setError(
         readableUiError(
@@ -2919,6 +2931,14 @@ function NotificationInboxPage({ ctx }) {
             children: notifications.map(notification => {
               const situation = notification?.payload?.situation
               const closure = closureNotificationPayload(notification)
+              const notificationWorkflow =
+                normalizeWorkflow(notification)
+              const closureHandledByWorkflow =
+                isV2Live(runtime) &&
+                Boolean(
+                  notificationWorkflow?.canClose ||
+                    notificationWorkflow?.canContinue
+                )
               const priority =
                 notification?.payload?.priority || 'INFORMATION'
               return jsxs('article', {
@@ -2985,7 +3005,27 @@ function NotificationInboxPage({ ctx }) {
                         runtime,
                         source: notification,
                         operatorRef: operator,
-                        onUpdated: () => void refresh()
+                        onUpdated: (_next, result) => {
+                          void refresh()
+                          if (result?.assignment) {
+                            void (async () => {
+                              await readNotification(
+                                ctx,
+                                notification.id
+                              )
+                              await openSituationChat(
+                                situation,
+                                operator || profile || undefined
+                              )
+                            })()
+                          }
+                          if (closure && result?.ok === true) {
+                            void readNotification(
+                              ctx,
+                              notification.id
+                            )
+                          }
+                        }
                       })
                     ]
                   }),
@@ -3024,7 +3064,7 @@ function NotificationInboxPage({ ctx }) {
                                     : 'Résoudre maintenant'
                               })
                             : null,
-                          closure
+                          closure && !closureHandledByWorkflow
                             ? jsx(Button, {
                                 size: 'sm',
                                 variant: 'secondary',
@@ -3034,7 +3074,7 @@ function NotificationInboxPage({ ctx }) {
                                 children: 'Continuer le suivi'
                               })
                             : null,
-                          closure
+                          closure && !closureHandledByWorkflow
                             ? jsx(Button, {
                                 size: 'sm',
                                 disabled: working === notification.id,
@@ -3100,10 +3140,13 @@ export default {
     }
     const unsubscribeFocusedProfile =
       host.state.focusedSessionProfile.subscribe(syncActiveProfile)
+    const unsubscribeFocusedSession =
+      host.state.focusedSessionId.subscribe(syncActiveProfile)
     const unsubscribeHomeProfile =
       host.state.profile.subscribe(syncActiveProfile)
     ctx.onDispose(() => {
       unsubscribeFocusedProfile()
+      unsubscribeFocusedSession()
       unsubscribeHomeProfile()
     })
     void refreshRuntimeHandshake(ctx, true)

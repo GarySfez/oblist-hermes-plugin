@@ -32,6 +32,9 @@ quality controls appear only when the authenticated runtime handshake reports
 `LIVE` with the exact release epoch expected by the plugin. A missing,
 unavailable or incompatible handshake leaves the V2 controls dormant; a live
 version mismatch blocks sensitive actions with a human-readable message.
+For a locked release, the gateway receives the exact manifest hash through
+`OBLIST_HERMES_MANIFEST_DIGEST`; a missing or malformed value keeps V2
+fail-closed.
 
 All workflow decisions use the existing authenticated plugin REST proxy. API
 paths and payload adaptation are centralized in `desktop/plugin.js` and
