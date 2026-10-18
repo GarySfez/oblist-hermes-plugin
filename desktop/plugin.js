@@ -1259,6 +1259,10 @@ function NotificationInboxPage({ ctx }) {
     })
   }, [ctx, operator])
 
+  useEffect(() => {
+    if (inbox.operator === operator) setError('')
+  }, [inbox, operator])
+
   const dismiss = async notification => {
     setWorking(notification.id)
     setError('')
