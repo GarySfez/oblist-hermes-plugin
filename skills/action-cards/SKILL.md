@@ -28,6 +28,20 @@ policies.
 - Prepare every immediately useful parallel action in the first response. When
   vendor input is needed, normally create both the customer holding/reply card and
   the appropriate vendor card instead of waiting for a second user prompt.
+- Before drafting, check the conversation's current assignee, age and latest
+  human-authored messages. Preserve an existing human owner's responsibility;
+  never route their case to another operator merely because that owner has no
+  Hermes profile.
+- Treat Fin answers, bot summaries and automated conversation summaries only as
+  unverified leads. Never conclude phishing, fraud, policy, sender identity or a
+  business fact from bot-authored content without corroborating human or system
+  evidence.
+- For an open conversation with no activity for more than 14 days, first decide
+  whether responding still creates concrete value. Do not prepare an external
+  reply merely to clear an old inbox item.
+- Read the available Intercom history before asking the CS operator for
+  information that could already be in messages, notes, assignments or side
+  conversations.
 - A customer holding reply should simply confirm that The Oblist is checking with
   the relevant partner and will follow up. Do not expose internal uncertainty.
 - Vendor requests must contain only the questions relevant to that seller and the
