@@ -1,10 +1,16 @@
 import {
+  atom,
   Badge,
   Button,
+  Codicon,
   Input,
+  ROUTES_AREA,
+  SIDEBAR_NAV_AREA,
+  STATUSBAR_AREAS,
   Textarea,
   TRANSCRIPT_DIRECTIVE_AREA,
-  host
+  host,
+  useValue
 } from '@hermes/plugin-sdk'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -14,6 +20,10 @@ const UUID_RE =
 
 const inFlightNotificationIds = new Set()
 let notificationPollRunning = false
+const notificationInboxAtom = atom({
+  operator: '',
+  notifications: []
+})
 
 const cardStyle = {
   width: 'min(720px, 100%)',
@@ -1077,18 +1087,48 @@ function OperationsOverview({
   })
 }
 
-async function pollDesktopNotifications(ctx) {
-  if (notificationPollRunning) return
-  notificationPollRunning = true
+function currentNotificationScope() {
   const focusedProfile = host.state.focusedSessionProfile.get()
   const homeProfile = host.state.profile.get()
   const profile = focusedProfile || homeProfile || ''
   const operator =
     profile === 'lyse' || profile === 'philippine' ? profile : ''
+  return { profile, operator }
+}
+
+function operatorQuery(operator) {
+  return operator ? `?operator=${encodeURIComponent(operator)}` : ''
+}
+
+async function refreshNotificationInbox(ctx) {
+  const { operator } = currentNotificationScope()
+  const data = await ctx.rest(
+    `/notification-inbox${operatorQuery(operator)}`,
+    { timeoutMs: 20_000 }
+  )
+  notificationInboxAtom.set({
+    operator,
+    notifications: Array.isArray(data?.notifications)
+      ? data.notifications
+      : []
+  })
+}
+
+async function readNotification(ctx, notificationId) {
+  const { operator } = currentNotificationScope()
+  await ctx.rest(
+    `/notifications/${notificationId}/read${operatorQuery(operator)}`,
+    { method: 'POST', body: {}, timeoutMs: 20_000 }
+  )
+  await refreshNotificationInbox(ctx)
+}
+
+async function pollDesktopNotifications(ctx) {
+  if (notificationPollRunning) return
+  notificationPollRunning = true
+  const { profile, operator } = currentNotificationScope()
   try {
-    const query = operator
-      ? `?operator=${encodeURIComponent(operator)}`
-      : ''
+    const query = operatorQuery(operator)
     const data = await ctx.rest(`/notifications${query}`, {
       timeoutMs: 20_000
     })
@@ -1150,11 +1190,278 @@ async function pollDesktopNotifications(ctx) {
         inFlightNotificationIds.delete(notification.id)
       }
     }
+    await refreshNotificationInbox(ctx)
   } catch {
     // Keep notifications pending while Desktop or the remote gateway is offline.
   } finally {
     notificationPollRunning = false
   }
+}
+
+function NotificationStatus({ ctx }) {
+  const inbox = useValue(notificationInboxAtom)
+  const focusedProfile = useValue(host.state.focusedSessionProfile)
+  const homeProfile = useValue(host.state.profile)
+  const currentOperator =
+    focusedProfile === 'lyse' || focusedProfile === 'philippine'
+      ? focusedProfile
+      : homeProfile === 'lyse' || homeProfile === 'philippine'
+        ? homeProfile
+        : ''
+  const count =
+    inbox.operator === currentOperator ? inbox.notifications.length : 0
+
+  useEffect(() => {
+    void refreshNotificationInbox(ctx).catch(() => undefined)
+  }, [ctx, currentOperator])
+
+  if (count === 0) return null
+  return jsxs('button', {
+    type: 'button',
+    onClick: () => host.navigate('/oblist-notifications'),
+    'aria-label': `${count} unread Customer Service notification${count > 1 ? 's' : ''}`,
+    style: {
+      display: 'inline-flex',
+      height: '100%',
+      alignItems: 'center',
+      gap: '5px',
+      border: 0,
+      borderRadius: 0,
+      padding: '0 7px',
+      background: 'transparent',
+      color: 'var(--ui-accent)',
+      cursor: 'pointer',
+      fontSize: '11px',
+      fontWeight: 700
+    },
+    children: [
+      jsx(Codicon, { name: 'bell', size: '0.75rem' }),
+      jsx('span', { children: `CS ${count}` })
+    ]
+  })
+}
+
+function NotificationInboxPage({ ctx }) {
+  const inbox = useValue(notificationInboxAtom)
+  const [working, setWorking] = useState('')
+  const [error, setError] = useState('')
+  const { profile, operator } = currentNotificationScope()
+  const notifications =
+    inbox.operator === operator ? inbox.notifications : []
+
+  useEffect(() => {
+    void refreshNotificationInbox(ctx).catch(refreshError => {
+      setError(
+        refreshError instanceof Error
+          ? refreshError.message.slice(0, 180)
+          : 'Notification inbox unavailable'
+      )
+    })
+  }, [ctx, operator])
+
+  const dismiss = async notification => {
+    setWorking(notification.id)
+    setError('')
+    try {
+      await readNotification(ctx, notification.id)
+    } catch (readError) {
+      setError(
+        readError instanceof Error
+          ? readError.message.slice(0, 180)
+          : 'Could not mark this notification as read'
+      )
+    } finally {
+      setWorking('')
+    }
+  }
+
+  const resolve = async notification => {
+    const situation = notification?.payload?.situation
+    if (!situation?.id) return
+    setWorking(notification.id)
+    setError('')
+    try {
+      await readNotification(ctx, notification.id)
+      await openSituationChat(
+        situation,
+        operator || profile || undefined
+      )
+    } catch (resolveError) {
+      setError(
+        resolveError instanceof Error
+          ? resolveError.message.slice(0, 180)
+          : 'Could not open this notification'
+      )
+    } finally {
+      setWorking('')
+    }
+  }
+
+  return jsxs('main', {
+    style: {
+      width: 'min(920px, 100%)',
+      margin: '0 auto',
+      padding: '24px',
+      color: 'var(--ui-text-primary)'
+    },
+    children: [
+      jsxs('header', {
+        style: {
+          display: 'flex',
+          alignItems: 'flex-start',
+          justifyContent: 'space-between',
+          gap: '14px',
+          marginBottom: '18px'
+        },
+        children: [
+          jsxs('div', {
+            style: { display: 'grid', gap: '4px' },
+            children: [
+              jsx('h1', {
+                style: { margin: 0, fontSize: '20px' },
+                children: 'CS Notifications'
+              }),
+              jsx('span', {
+                style: {
+                  color: 'var(--ui-text-tertiary)',
+                  fontSize: '12px'
+                },
+                children: `${notifications.length} unread · ${operator || 'Gary global view'}`
+              })
+            ]
+          }),
+          jsx(Button, {
+            size: 'sm',
+            variant: 'secondary',
+            onClick: () =>
+              void refreshNotificationInbox(ctx).catch(() => undefined),
+            children: 'Refresh'
+          })
+        ]
+      }),
+      error
+        ? jsx('div', {
+            role: 'alert',
+            style: {
+              marginBottom: '12px',
+              color: 'var(--ui-danger)',
+              fontSize: '12px'
+            },
+            children: error
+          })
+        : null,
+      notifications.length === 0
+        ? jsx('section', {
+            style: {
+              padding: '28px',
+              border: '1px solid var(--ui-stroke-secondary)',
+              borderRadius: '12px',
+              color: 'var(--ui-text-tertiary)',
+              textAlign: 'center'
+            },
+            children: 'No unread Customer Service notification.'
+          })
+        : jsx('div', {
+            style: { display: 'grid', gap: '10px' },
+            children: notifications.map(notification => {
+              const situation = notification?.payload?.situation
+              const priority =
+                notification?.payload?.priority || 'INFORMATION'
+              return jsxs('article', {
+                style: cardStyle,
+                children: [
+                  jsxs('div', {
+                    style: headerStyle,
+                    children: [
+                      jsxs('div', {
+                        style: { display: 'grid', gap: '4px' },
+                        children: [
+                          jsx('strong', {
+                            style: { fontSize: '13px' },
+                            children: notification.title
+                          }),
+                          jsx('span', {
+                            style: {
+                              color: 'var(--ui-text-tertiary)',
+                              fontSize: '11px'
+                            },
+                            children: new Date(
+                              notification.createdAt
+                            ).toLocaleString()
+                          })
+                        ]
+                      }),
+                      jsx(Badge, { children: priority })
+                    ]
+                  }),
+                  jsxs('div', {
+                    style: bodyStyle,
+                    children: [
+                      jsx('span', {
+                        style: {
+                          color: 'var(--ui-text-secondary)',
+                          fontSize: '13px',
+                          lineHeight: 1.5
+                        },
+                        children: notification.body
+                      }),
+                      situation?.summary
+                        ? jsx('span', {
+                            style: {
+                              color: 'var(--ui-text-tertiary)',
+                              fontSize: '12px',
+                              lineHeight: 1.45
+                            },
+                            children: situation.summary
+                          })
+                        : null
+                    ]
+                  }),
+                  jsxs('div', {
+                    style: footerStyle,
+                    children: [
+                      jsx('div', {
+                        style: rowStyle,
+                        children: (situation?.links || []).map(link =>
+                          jsx(Button, {
+                            size: 'sm',
+                            variant: 'secondary',
+                            onClick: () => ctx.os.openExternal(link.url),
+                            children: link.label
+                          })
+                        )
+                      }),
+                      jsxs('div', {
+                        style: rowStyle,
+                        children: [
+                          jsx(Button, {
+                            size: 'sm',
+                            variant: 'secondary',
+                            disabled: working === notification.id,
+                            onClick: () => dismiss(notification),
+                            children: 'Dismiss'
+                          }),
+                          situation?.id
+                            ? jsx(Button, {
+                                size: 'sm',
+                                disabled: working === notification.id,
+                                onClick: () => resolve(notification),
+                                children:
+                                  working === notification.id
+                                    ? 'Opening…'
+                                    : 'Resolve now'
+                              })
+                            : null
+                        ]
+                      })
+                    ]
+                  })
+                ]
+              })
+            })
+          })
+    ]
+  })
 }
 
 export default {
@@ -1167,6 +1474,28 @@ export default {
       30_000
     )
     ctx.onDispose(() => window.clearInterval(notificationTimer))
+    ctx.register({
+      id: 'oblist-notification-inbox-page',
+      area: ROUTES_AREA,
+      data: { path: '/oblist-notifications' },
+      render: () => jsx(NotificationInboxPage, { ctx })
+    })
+    ctx.register({
+      id: 'oblist-notification-inbox-nav',
+      area: SIDEBAR_NAV_AREA,
+      order: 45,
+      data: {
+        path: '/oblist-notifications',
+        label: 'CS Alerts',
+        codicon: 'bell'
+      }
+    })
+    ctx.register({
+      id: 'oblist-notification-count',
+      area: STATUSBAR_AREAS.right,
+      order: 70,
+      render: () => jsx(NotificationStatus, { ctx })
+    })
     ctx.register({
       id: 'oblist-action-card-directive',
       area: TRANSCRIPT_DIRECTIVE_AREA,

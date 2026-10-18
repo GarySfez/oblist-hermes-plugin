@@ -122,6 +122,21 @@ async def get_notifications(request: Request):
     )
 
 
+@router.get("/notification-inbox")
+async def get_notification_inbox(request: Request):
+    operator = _validated_operator(request.query_params.get("operator", ""))
+    query = urllib.parse.urlencode(
+        {
+            **({"operatorRef": operator} if operator else {}),
+            "limit": "50",
+        }
+    )
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        f"/v1/desktop-notification-inbox?{query}",
+    )
+
+
 @router.post("/notifications/{notification_id}/outcome")
 async def mark_notification(
     notification_id: str,
@@ -142,6 +157,25 @@ async def mark_notification(
     return await asyncio.to_thread(
         _request_ai_ops,
         f"/v1/desktop-notifications/{notification_id}/outcome",
+        "POST",
+        payload,
+    )
+
+
+@router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: str,
+    request: Request,
+):
+    notification_id = _validated_id(notification_id)
+    operator = _validated_operator(request.query_params.get("operator", ""))
+    payload = {
+        "actorRef": _actor_ref(request),
+        **({"operatorRef": operator} if operator else {}),
+    }
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        f"/v1/desktop-notifications/{notification_id}/read",
         "POST",
         payload,
     )
