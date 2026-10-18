@@ -1312,19 +1312,30 @@ function NotificationBanner() {
 function NotificationInboxPage({ ctx }) {
   const inbox = useValue(notificationInboxAtom)
   const [working, setWorking] = useState('')
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const { profile, operator } = currentNotificationScope()
   const notifications =
     inbox.operator === operator ? inbox.notifications : []
 
-  useEffect(() => {
-    void refreshNotificationInbox(ctx).catch(refreshError => {
+  const refresh = async () => {
+    setRefreshing(true)
+    try {
+      await refreshNotificationInbox(ctx)
+      setError('')
+    } catch (refreshError) {
       setError(
         refreshError instanceof Error
           ? refreshError.message.slice(0, 180)
           : 'Notification inbox unavailable'
       )
-    })
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  useEffect(() => {
+    void refresh()
   }, [ctx, operator])
 
   useEffect(() => {
@@ -1405,9 +1416,9 @@ function NotificationInboxPage({ ctx }) {
           jsx(Button, {
             size: 'sm',
             variant: 'secondary',
-            onClick: () =>
-              void refreshNotificationInbox(ctx).catch(() => undefined),
-            children: 'Refresh'
+            disabled: refreshing,
+            onClick: () => void refresh(),
+            children: refreshing ? 'Refreshing…' : 'Refresh'
           })
         ]
       }),
@@ -1552,15 +1563,26 @@ export default {
       data: { path: '/oblist-notifications' },
       render: () => jsx(NotificationInboxPage, { ctx })
     })
-    ctx.register({
-      id: 'oblist-notification-inbox-nav',
-      area: SIDEBAR_NAV_AREA,
-      order: 45,
-      data: {
-        path: '/oblist-notifications',
-        label: 'CS Alerts',
-        codicon: 'bell'
+    let disposeNotificationNav = () => undefined
+    const unsubscribeNotificationNav = notificationInboxAtom.subscribe(
+      inbox => {
+        disposeNotificationNav()
+        const count = inbox.notifications.length
+        disposeNotificationNav = ctx.register({
+          id: 'oblist-notification-inbox-nav',
+          area: SIDEBAR_NAV_AREA,
+          order: 45,
+          data: {
+            path: '/oblist-notifications',
+            label: count > 0 ? `🔴 CS Alerts (${count})` : 'CS Alerts',
+            codicon: 'bell'
+          }
+        })
       }
+    )
+    ctx.onDispose(() => {
+      unsubscribeNotificationNav()
+      disposeNotificationNav()
     })
     ctx.register({
       id: 'oblist-notification-count',
