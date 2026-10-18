@@ -123,11 +123,14 @@ def _require_oblist_operator(request: Request) -> None:
 def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) -> dict:
     base_url = os.environ.get(
         "OBLIST_MEMORY_API_URL",
-        "http://ai-ops-memory-api.railway.internal:8787",
+        "https://ai-ops-memory-api-production.up.railway.app",
     ).rstrip("/")
-    token = os.environ.get("OBLIST_ACTION_CARD_REVIEW_TOKEN", "")
+    token = (
+        os.environ.get("OBLIST_ACTION_CARD_REVIEW_TOKEN", "")
+        or os.environ.get("MCP_OBLIST_ACTIONS_API_KEY", "")
+    )
     if not token:
-        raise RuntimeError("OBLIST_ACTION_CARD_REVIEW_TOKEN is not configured")
+        raise RuntimeError("No action-card gateway token is configured")
     request = urllib.request.Request(
         f"{base_url}{path}",
         data=None if body is None else json.dumps(body).encode("utf-8"),

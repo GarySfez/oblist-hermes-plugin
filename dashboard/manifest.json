@@ -3,10 +3,10 @@
   "label": "The Oblist Action Cards",
   "description": "Editable customer and vendor action cards rendered inline in Hermes conversations.",
   "icon": "Checklist",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "tab": {
     "hidden": true
   },
-  "entry": "dist/index.js",
+  "entry": "index.js",
   "api": "plugin_api.py"
 }
