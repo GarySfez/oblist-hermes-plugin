@@ -4,9 +4,7 @@ import {
   Input,
   Textarea,
   TRANSCRIPT_DIRECTIVE_AREA,
-  host,
-  useQuery,
-  useValue
+  host
 } from '@hermes/plugin-sdk'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
@@ -15,6 +13,7 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 const inFlightNotificationIds = new Set()
+let notificationPollRunning = false
 
 const cardStyle = {
   width: 'min(720px, 100%)',
@@ -785,6 +784,13 @@ const CS_VIEW_OPTIONS = [
 ]
 
 function resolutionPrompt(situation) {
+  if ((situation.signals || []).includes('TEST_ONLY')) {
+    return [
+      'Ceci est un test de notification Hermes, pas un dossier client réel.',
+      'Confirme que le bouton Resolve now a correctement ouvert ce chat dédié.',
+      'Ne contacte personne et ne prépare aucune action externe.'
+    ].join('\n')
+  }
   return [
     `Résous maintenant cette situation CS : ${situation.id}.`,
     situation.title,
@@ -1071,116 +1077,96 @@ function OperationsOverview({
   })
 }
 
-function NotificationPoller({ ctx }) {
-  const focusedProfile = useValue(host.state.focusedSessionProfile)
-  const homeProfile = useValue(host.state.profile)
+async function pollDesktopNotifications(ctx) {
+  if (notificationPollRunning) return
+  notificationPollRunning = true
+  const focusedProfile = host.state.focusedSessionProfile.get()
+  const homeProfile = host.state.profile.get()
   const profile = focusedProfile || homeProfile || ''
   const operator =
     profile === 'lyse' || profile === 'philippine' ? profile : ''
-
-  const { data } = useQuery({
-    queryKey: ['oblist-action-cards', 'notifications', operator],
-    queryFn: () => {
-      const query = operator
-        ? `?operator=${encodeURIComponent(operator)}`
-        : ''
-      return ctx.rest(`/notifications${query}`, { timeoutMs: 20_000 })
-    },
-    refetchInterval: 30_000,
-    refetchOnWindowFocus: true,
-    retry: 2
-  })
-
-  useEffect(() => {
+  try {
+    const query = operator
+      ? `?operator=${encodeURIComponent(operator)}`
+      : ''
+    const data = await ctx.rest(`/notifications${query}`, {
+      timeoutMs: 20_000
+    })
     const notifications = Array.isArray(data?.notifications)
       ? data.notifications
       : []
-    if (notifications.length === 0) return undefined
-
-    let cancelled = false
-    const deliver = async () => {
-      for (const notification of notifications) {
-        if (
-          cancelled ||
-          !UUID_RE.test(notification?.id || '') ||
-          inFlightNotificationIds.has(notification.id)
-        ) {
-          continue
-        }
-        inFlightNotificationIds.add(notification.id)
-        const situation = notification?.payload?.situation
-        try {
-          if (!situation?.id) throw new Error('INVALID_SITUATION_PAYLOAD')
-          const resolve = () =>
-            openSituationChat(situation, operator || profile || undefined)
-          host.notify({
-            kind: 'info',
-            message: `${notification.title} · ${notification.body}`
-          })
-          await ctx.os.notify({
-            title: notification.title,
-            body: notification.body,
-            onActivate: resolve,
-            actions: [
-              {
-                id: 'resolve-now',
-                label: 'Resolve now',
-                onAction: resolve
-              }
-            ]
-          })
-          const query = operator
-            ? `?operator=${encodeURIComponent(operator)}`
-            : ''
-          await ctx.rest(
-            `/notifications/${notification.id}/outcome${query}`,
+    for (const notification of notifications) {
+      if (
+        !UUID_RE.test(notification?.id || '') ||
+        inFlightNotificationIds.has(notification.id)
+      ) {
+        continue
+      }
+      inFlightNotificationIds.add(notification.id)
+      const situation = notification?.payload?.situation
+      try {
+        if (!situation?.id) throw new Error('INVALID_SITUATION_PAYLOAD')
+        const resolve = () =>
+          openSituationChat(situation, operator || profile || undefined)
+        host.notify({
+          kind: 'info',
+          message: `${notification.title} · ${notification.body}`
+        })
+        await ctx.os.notify({
+          title: notification.title,
+          body: notification.body,
+          onActivate: resolve,
+          actions: [
             {
-              method: 'POST',
-              body: { outcome: 'DELIVERED' },
-              timeoutMs: 20_000
+              id: 'resolve-now',
+              label: 'Resolve now',
+              onAction: resolve
             }
-          )
-        } catch (deliveryError) {
-          const query = operator
-            ? `?operator=${encodeURIComponent(operator)}`
-            : ''
-          await ctx
-            .rest(`/notifications/${notification.id}/outcome${query}`, {
-              method: 'POST',
-              body: {
-                outcome: 'RETRY',
-                errorCode:
-                  deliveryError instanceof Error
-                    ? deliveryError.message.slice(0, 100)
-                    : 'DESKTOP_DELIVERY_FAILED'
-              },
-              timeoutMs: 20_000
-            })
-            .catch(() => undefined)
-        } finally {
-          inFlightNotificationIds.delete(notification.id)
-        }
+          ]
+        })
+        await ctx.rest(
+          `/notifications/${notification.id}/outcome${query}`,
+          {
+            method: 'POST',
+            body: { outcome: 'DELIVERED' },
+            timeoutMs: 20_000
+          }
+        )
+      } catch (deliveryError) {
+        await ctx
+          .rest(`/notifications/${notification.id}/outcome${query}`, {
+            method: 'POST',
+            body: {
+              outcome: 'RETRY',
+              errorCode:
+                deliveryError instanceof Error
+                  ? deliveryError.message.slice(0, 100)
+                  : 'DESKTOP_DELIVERY_FAILED'
+            },
+            timeoutMs: 20_000
+          })
+          .catch(() => undefined)
+      } finally {
+        inFlightNotificationIds.delete(notification.id)
       }
     }
-    void deliver()
-    return () => {
-      cancelled = true
-    }
-  }, [ctx, data, operator, profile])
-
-  return null
+  } catch {
+    // Keep notifications pending while Desktop or the remote gateway is offline.
+  } finally {
+    notificationPollRunning = false
+  }
 }
 
 export default {
   id: 'oblist-action-cards',
   name: 'The Oblist Action Cards',
   register(ctx) {
-    ctx.register({
-      id: 'oblist-proactive-notification-poller',
-      area: 'statusBar.right',
-      order: 10_000,
-      render: () => jsx(NotificationPoller, { ctx })
-    })
+    void pollDesktopNotifications(ctx)
+    const notificationTimer = window.setInterval(
+      () => void pollDesktopNotifications(ctx),
+      30_000
+    )
+    ctx.onDispose(() => window.clearInterval(notificationTimer))
     ctx.register({
       id: 'oblist-action-card-directive',
       area: TRANSCRIPT_DIRECTIVE_AREA,
