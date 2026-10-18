@@ -20,10 +20,14 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 const inFlightNotificationIds = new Set()
-let notificationPollRunning = false
+const notificationPollRunning = new Set()
 const notificationInboxAtom = atom({
-  operator: '',
-  notifications: []
+  activeOperator: '',
+  byOperator: {
+    '': [],
+    lyse: [],
+    philippine: []
+  }
 })
 
 const cardStyle = {
@@ -1091,7 +1095,7 @@ function OperationsOverview({
 function currentNotificationScope() {
   const focusedProfile = host.state.focusedSessionProfile.get()
   const homeProfile = host.state.profile.get()
-  const profile = focusedProfile || homeProfile || ''
+  const profile = homeProfile || focusedProfile || ''
   const operator =
     profile === 'lyse' || profile === 'philippine' ? profile : ''
   return { profile, operator }
@@ -1101,17 +1105,36 @@ function operatorQuery(operator) {
   return operator ? `?operator=${encodeURIComponent(operator)}` : ''
 }
 
-async function refreshNotificationInbox(ctx) {
-  const { operator } = currentNotificationScope()
+function notificationsForOperator(inbox, operator) {
+  return inbox.byOperator?.[operator] || []
+}
+
+function setActiveNotificationOperator(operator) {
+  const current = notificationInboxAtom.get()
+  if (current.activeOperator === operator) return
+  notificationInboxAtom.set({
+    ...current,
+    activeOperator: operator
+  })
+}
+
+async function refreshNotificationInbox(
+  ctx,
+  operator = currentNotificationScope().operator
+) {
   const data = await ctx.rest(
     `/notification-inbox${operatorQuery(operator)}`,
     { timeoutMs: 20_000 }
   )
+  const current = notificationInboxAtom.get()
   notificationInboxAtom.set({
-    operator,
-    notifications: Array.isArray(data?.notifications)
-      ? data.notifications
-      : []
+    ...current,
+    byOperator: {
+      ...current.byOperator,
+      [operator]: Array.isArray(data?.notifications)
+        ? data.notifications
+        : []
+    }
   })
 }
 
@@ -1121,13 +1144,14 @@ async function readNotification(ctx, notificationId) {
     `/notifications/${notificationId}/read${operatorQuery(operator)}`,
     { method: 'POST', body: {}, timeoutMs: 20_000 }
   )
-  await refreshNotificationInbox(ctx)
+  await refreshNotificationInbox(ctx, operator)
 }
 
 async function pollDesktopNotifications(ctx) {
-  if (notificationPollRunning) return
-  notificationPollRunning = true
   const { profile, operator } = currentNotificationScope()
+  setActiveNotificationOperator(operator)
+  if (notificationPollRunning.has(operator)) return
+  notificationPollRunning.add(operator)
   try {
     const query = operatorQuery(operator)
     const data = await ctx.rest(`/notifications${query}`, {
@@ -1191,11 +1215,11 @@ async function pollDesktopNotifications(ctx) {
         inFlightNotificationIds.delete(notification.id)
       }
     }
-    await refreshNotificationInbox(ctx)
+    await refreshNotificationInbox(ctx, operator)
   } catch {
     // Keep notifications pending while Desktop or the remote gateway is offline.
   } finally {
-    notificationPollRunning = false
+    notificationPollRunning.delete(operator)
   }
 }
 
@@ -1204,16 +1228,19 @@ function NotificationStatus({ ctx }) {
   const focusedProfile = useValue(host.state.focusedSessionProfile)
   const homeProfile = useValue(host.state.profile)
   const currentOperator =
-    focusedProfile === 'lyse' || focusedProfile === 'philippine'
-      ? focusedProfile
-      : homeProfile === 'lyse' || homeProfile === 'philippine'
-        ? homeProfile
+    homeProfile === 'lyse' || homeProfile === 'philippine'
+      ? homeProfile
+      : focusedProfile === 'lyse' || focusedProfile === 'philippine'
+        ? focusedProfile
         : ''
-  const count =
-    inbox.operator === currentOperator ? inbox.notifications.length : 0
+  const count = notificationsForOperator(
+    inbox,
+    currentOperator
+  ).length
 
   useEffect(() => {
-    void refreshNotificationInbox(ctx).catch(() => undefined)
+    setActiveNotificationOperator(currentOperator)
+    void pollDesktopNotifications(ctx)
   }, [ctx, currentOperator])
 
   if (count === 0) return null
@@ -1247,13 +1274,15 @@ function NotificationBanner() {
   const focusedProfile = useValue(host.state.focusedSessionProfile)
   const homeProfile = useValue(host.state.profile)
   const currentOperator =
-    focusedProfile === 'lyse' || focusedProfile === 'philippine'
-      ? focusedProfile
-      : homeProfile === 'lyse' || homeProfile === 'philippine'
-        ? homeProfile
+    homeProfile === 'lyse' || homeProfile === 'philippine'
+      ? homeProfile
+      : focusedProfile === 'lyse' || focusedProfile === 'philippine'
+        ? focusedProfile
         : ''
-  const count =
-    inbox.operator === currentOperator ? inbox.notifications.length : 0
+  const count = notificationsForOperator(
+    inbox,
+    currentOperator
+  ).length
 
   if (count === 0) return null
   return jsxs('button', {
@@ -1315,13 +1344,12 @@ function NotificationInboxPage({ ctx }) {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const { profile, operator } = currentNotificationScope()
-  const notifications =
-    inbox.operator === operator ? inbox.notifications : []
+  const notifications = notificationsForOperator(inbox, operator)
 
   const refresh = async () => {
     setRefreshing(true)
     try {
-      await refreshNotificationInbox(ctx)
+      await refreshNotificationInbox(ctx, operator)
       setError('')
     } catch (refreshError) {
       setError(
@@ -1339,7 +1367,7 @@ function NotificationInboxPage({ ctx }) {
   }, [ctx, operator])
 
   useEffect(() => {
-    if (inbox.operator === operator) setError('')
+    if (inbox.byOperator?.[operator]) setError('')
   }, [inbox, operator])
 
   const dismiss = async notification => {
@@ -1551,7 +1579,20 @@ export default {
   id: 'oblist-action-cards',
   name: 'The Oblist Action Cards',
   register(ctx) {
-    void pollDesktopNotifications(ctx)
+    const syncActiveProfile = () => {
+      const { operator } = currentNotificationScope()
+      setActiveNotificationOperator(operator)
+      void pollDesktopNotifications(ctx)
+    }
+    const unsubscribeFocusedProfile =
+      host.state.focusedSessionProfile.subscribe(syncActiveProfile)
+    const unsubscribeHomeProfile =
+      host.state.profile.subscribe(syncActiveProfile)
+    ctx.onDispose(() => {
+      unsubscribeFocusedProfile()
+      unsubscribeHomeProfile()
+    })
+    syncActiveProfile()
     const notificationTimer = window.setInterval(
       () => void pollDesktopNotifications(ctx),
       30_000
@@ -1567,7 +1608,10 @@ export default {
     const unsubscribeNotificationNav = notificationInboxAtom.subscribe(
       inbox => {
         disposeNotificationNav()
-        const count = inbox.notifications.length
+        const count = notificationsForOperator(
+          inbox,
+          inbox.activeOperator
+        ).length
         disposeNotificationNav = ctx.register({
           id: 'oblist-notification-inbox-nav',
           area: SIDEBAR_NAV_AREA,
