@@ -3,11 +3,13 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -23,6 +25,181 @@ _OPERATOR_BY_EMAIL = {
     "philippine@oblist.com": "philippine",
 }
 _IDENTITY_CACHE: dict[str, tuple[float, str]] = {}
+_PREFLIGHT_CACHE: dict[
+    tuple[str, str, str],
+    tuple[float, int, bool],
+] = {}
+_PLUGIN_VERSION = "0.4.0"
+_RELEASE_EPOCH = "hermes-intelligence-v2"
+_AI_OPS_API_PATHS = {
+    "runtime_handshake": "/v1/release/handshake",
+    "action": "/v1/action-cards/{action_id}",
+    "action_edit": "/v1/action-cards/{action_id}/edit",
+    "action_decision": "/v1/action-cards/{action_id}/decision",
+    "action_execute": "/v1/action-cards/{action_id}/execute",
+    "action_outcome": "/v1/action-cards/{action_id}/outcome",
+    "overview": "/v1/cs-overview",
+    "notifications": "/v1/desktop-notifications",
+    "notification_inbox": "/v1/desktop-notification-inbox",
+    "notification_outcome": (
+        "/v1/desktop-notifications/{notification_id}/outcome"
+    ),
+    "notification_read": (
+        "/v1/desktop-notifications/{notification_id}/read"
+    ),
+    "workflow_claim": "/v1/case-watches/{workflow_id}/claim",
+    "workflow_confirm_assignment": (
+        "/v1/case-watches/{workflow_id}/claim/confirm"
+    ),
+    "workflow_closure": "/v1/case-watches/{workflow_id}/closure",
+}
+_RELEASE_CONTRACT_PATH = Path(__file__).with_name("release_contract.json")
+
+
+def _api_path(name: str, **values: str) -> str:
+    return _AI_OPS_API_PATHS[name].format(**values)
+
+
+def _runtime_handshake_path() -> str:
+    return _api_path("runtime_handshake")
+
+
+def _release_contract() -> dict:
+    try:
+        contract = json.loads(_RELEASE_CONTRACT_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("Plugin release contract is unavailable") from error
+    required = {
+        "releaseVersion",
+        "contractVersion",
+        "schemaVersion",
+        "memoryApiVersion",
+        "workerVersion",
+        "pluginVersion",
+    }
+    if (
+        not isinstance(contract, dict)
+        or not required.issubset(contract)
+        or any(not isinstance(contract[key], str) for key in required)
+    ):
+        raise RuntimeError("Plugin release contract is invalid")
+    digest = contract.get("manifestDigest")
+    if digest is not None and (
+        not isinstance(digest, str)
+        or not re.fullmatch(r"sha256:[a-f0-9]{64}", digest)
+    ):
+        raise RuntimeError("Plugin manifest digest is invalid")
+    return contract
+
+
+def _release_headers(contract: dict, release_epoch: int | None = None) -> dict:
+    headers = {
+        "X-Hermes-Release-Version": contract["releaseVersion"],
+        "X-Hermes-Contract-Version": contract["contractVersion"],
+        "X-Hermes-Schema-Version": contract["schemaVersion"],
+        "X-Hermes-Memory-Api-Version": contract["memoryApiVersion"],
+        "X-Hermes-Worker-Version": contract["workerVersion"],
+        "X-Hermes-Plugin-Version": contract["pluginVersion"],
+    }
+    if isinstance(contract.get("manifestDigest"), str):
+        headers["X-Hermes-Manifest-Digest"] = contract["manifestDigest"]
+    if release_epoch is not None:
+        headers["X-Hermes-Release-Epoch"] = str(release_epoch)
+    return headers
+
+
+def _release_preflight(
+    base_url: str,
+    token: str,
+    contract: dict,
+) -> tuple[int, bool]:
+    request = urllib.request.Request(
+        f"{base_url}/v1/release/handshake",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            **_release_headers(contract),
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(
+            f"Release handshake rejected with {error.code}"
+        ) from error
+    except Exception as error:
+        raise RuntimeError("Release handshake is unavailable") from error
+    epoch = payload.get("releaseEpoch") if isinstance(payload, dict) else None
+    if not isinstance(epoch, int) or epoch < 0:
+        raise RuntimeError("Release handshake returned an invalid epoch")
+    return epoch, payload.get("preflightCompatible") is True
+
+
+def _cached_release_preflight(
+    base_url: str,
+    token: str,
+    contract: dict,
+    force: bool = False,
+) -> tuple[int, bool]:
+    contract_key = "|".join(
+        str(contract.get(key, ""))
+        for key in (
+            "releaseVersion",
+            "contractVersion",
+            "schemaVersion",
+            "memoryApiVersion",
+            "workerVersion",
+            "pluginVersion",
+            "manifestDigest",
+        )
+    )
+    key = (base_url, token, contract_key)
+    cached = _PREFLIGHT_CACHE.get(key)
+    if not force and cached and cached[0] > time.monotonic():
+        return cached[1], cached[2]
+    epoch, compatible = _release_preflight(
+        base_url,
+        token,
+        contract,
+    )
+    _PREFLIGHT_CACHE[key] = (
+        time.monotonic() + 10,
+        epoch,
+        compatible,
+    )
+    return epoch, compatible
+
+
+def _verify_release_response(
+    response,
+    contract: dict,
+    release_epoch: int,
+    preflight_compatible: bool,
+) -> None:
+    if response.headers.get("x-hermes-release-epoch") != str(release_epoch):
+        raise RuntimeError("AI Ops release epoch changed during request")
+    if not preflight_compatible:
+        if response.headers.get("x-hermes-runtime-mode") != "OFF":
+            raise RuntimeError("AI Ops did not fail closed on contract mismatch")
+        return
+    expected = {
+        "x-hermes-release-version": contract["releaseVersion"],
+        "x-hermes-contract-version": contract["contractVersion"],
+        "x-hermes-schema-version": contract["schemaVersion"],
+        "x-hermes-memory-api-version": contract["memoryApiVersion"],
+        "x-hermes-worker-version": contract["workerVersion"],
+        "x-hermes-plugin-version": contract["pluginVersion"],
+    }
+    for header, value in expected.items():
+        if response.headers.get(header) != value:
+            raise RuntimeError("AI Ops release handshake changed during request")
+    if (
+        response.headers.get("x-hermes-configured-mode") == "LIVE"
+        and response.headers.get("x-hermes-handshake-compatible") != "true"
+    ):
+        raise RuntimeError("AI Ops refused the plugin release handshake")
 
 
 def _configured_identity_map() -> dict[str, str]:
@@ -131,6 +308,17 @@ def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) ->
     )
     if not token:
         raise RuntimeError("No action-card gateway token is configured")
+    contract = _release_contract()
+    force_preflight = (
+        path.endswith("/execute")
+        or path.endswith("/claim/confirm")
+    )
+    release_epoch, preflight_compatible = _cached_release_preflight(
+        base_url,
+        token,
+        contract,
+        force_preflight,
+    )
     request = urllib.request.Request(
         f"{base_url}{path}",
         data=None if body is None else json.dumps(body).encode("utf-8"),
@@ -138,11 +326,22 @@ def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) ->
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
+            **_release_headers(contract, release_epoch),
         },
         method=method,
     )
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
+            try:
+                _verify_release_response(
+                    response,
+                    contract,
+                    release_epoch,
+                    preflight_compatible,
+                )
+            except RuntimeError:
+                _PREFLIGHT_CACHE.clear()
+                raise
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         detail = "Action Card Gateway rejected the request"
@@ -153,6 +352,106 @@ def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) ->
         except Exception:
             pass
         raise HTTPException(status_code=error.code, detail=detail) from error
+
+
+def _normalized_runtime(payload: dict) -> dict:
+    mode = payload.get("configuredMode")
+    if mode not in {"OFF", "SHADOW", "LIVE"}:
+        mode = payload.get("effectiveMode")
+    if mode not in {"OFF", "SHADOW", "LIVE"}:
+        mode = "OFF"
+    versions = payload.get("versions")
+    if not isinstance(versions, dict):
+        versions = {}
+    compatible = (
+        payload.get("preflightCompatible") is True
+        and versions.get("releaseVersion") == _RELEASE_EPOCH
+        and versions.get("pluginVersion") == _PLUGIN_VERSION
+    )
+    control_epoch = payload.get("releaseEpoch")
+    return {
+        "mode": mode,
+        "releaseEpoch": _RELEASE_EPOCH if compatible else None,
+        "controlEpoch": (
+            control_epoch
+            if isinstance(control_epoch, int) and control_epoch >= 0
+            else None
+        ),
+        "compatible": compatible,
+        "pluginVersion": _PLUGIN_VERSION,
+        "fallback": "V1",
+    }
+
+
+def _v1_runtime_fallback() -> dict:
+    return {
+        "mode": "OFF",
+        "releaseEpoch": None,
+        "compatible": False,
+        "pluginVersion": _PLUGIN_VERSION,
+        "fallback": "V1",
+    }
+
+
+def _fetch_runtime() -> dict:
+    return _normalized_runtime(_request_ai_ops(_runtime_handshake_path()))
+
+
+def _require_live_runtime() -> dict:
+    try:
+        runtime = _fetch_runtime()
+    except Exception as error:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Le suivi avancé est temporairement indisponible. "
+                "Aucune action n’a été effectuée."
+            ),
+        ) from error
+    if (
+        runtime["mode"] != "LIVE"
+        or not runtime["compatible"]
+        or runtime["releaseEpoch"] != _RELEASE_EPOCH
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Le suivi avancé n’est pas disponible dans cette version. "
+                "Aucune action n’a été effectuée."
+            ),
+        )
+    return runtime
+
+
+def _workflow_action_payload(
+    body: dict,
+    request: Request,
+    operator: str,
+) -> dict:
+    expected_version = body.get("expectedVersion")
+    if expected_version is not None and (
+        isinstance(expected_version, bool)
+        or not isinstance(expected_version, int)
+        or expected_version < 1
+    ):
+        raise HTTPException(status_code=400, detail="Invalid workflow version")
+    reservation_ref = body.get("reservationRef")
+    if reservation_ref is not None and not isinstance(reservation_ref, str):
+        raise HTTPException(status_code=400, detail="Invalid reservation")
+    return {
+        "actorRef": _actor_ref(request),
+        **({"operatorRef": operator} if operator else {}),
+        **(
+            {"expectedWorkflowCycle": expected_version}
+            if expected_version is not None
+            else {}
+        ),
+        **(
+            {"claimToken": reservation_ref[:300]}
+            if reservation_ref
+            else {}
+        ),
+    }
 
 
 def _validated_id(action_id: str) -> str:
@@ -167,13 +466,26 @@ def _validated_operator(value: str) -> str:
     return value
 
 
+@router.get("/runtime")
+async def get_runtime(request: Request):
+    _require_oblist_operator(request)
+    try:
+        runtime = await asyncio.to_thread(_fetch_runtime)
+    except Exception:
+        runtime = _v1_runtime_fallback()
+    return {
+        **runtime,
+        "checkedAt": int(time.time() * 1000),
+    }
+
+
 @router.get("/actions/{action_id}")
 async def get_action(action_id: str, request: Request):
     _require_oblist_operator(request)
     action_id = _validated_id(action_id)
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/action-cards/{action_id}",
+        _api_path("action", action_id=action_id),
     )
 
 
@@ -204,7 +516,7 @@ async def get_overview(request: Request):
     )
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/cs-overview?{query}",
+        f"{_api_path('overview')}?{query}",
     )
 
 
@@ -218,11 +530,12 @@ async def get_notifications(request: Request):
         {
             **({"operatorRef": operator} if operator else {}),
             "limit": "3",
+            "leaseOwner": f"desktop:{operator or 'gary'}:{uuid.uuid4()}",
         }
     )
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/desktop-notifications?{query}",
+        f"{_api_path('notifications')}?{query}",
     )
 
 
@@ -240,7 +553,7 @@ async def get_notification_inbox(request: Request):
     )
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/desktop-notification-inbox?{query}",
+        f"{_api_path('notification_inbox')}?{query}",
     )
 
 
@@ -258,15 +571,24 @@ async def mark_notification(
     outcome = body.get("outcome")
     if outcome not in {"DELIVERED", "RETRY"}:
         raise HTTPException(status_code=400, detail="Invalid outcome")
+    delivery_token = body.get("deliveryToken")
+    if not isinstance(delivery_token, str) or not _UUID_RE.fullmatch(
+        delivery_token
+    ):
+        raise HTTPException(status_code=400, detail="Invalid delivery token")
     payload = {
         "outcome": outcome,
+        "deliveryToken": delivery_token,
         **({"operatorRef": operator} if operator else {}),
     }
     if isinstance(body.get("errorCode"), str):
         payload["errorCode"] = body["errorCode"][:100]
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/desktop-notifications/{notification_id}/outcome",
+        _api_path(
+            "notification_outcome",
+            notification_id=notification_id,
+        ),
         "POST",
         payload,
     )
@@ -288,7 +610,124 @@ async def mark_notification_read(
     }
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/desktop-notifications/{notification_id}/read",
+        _api_path(
+            "notification_read",
+            notification_id=notification_id,
+        ),
+        "POST",
+        payload,
+    )
+
+
+@router.post("/workflows/{workflow_id}/claim")
+async def claim_workflow(workflow_id: str, body: dict, request: Request):
+    workflow_id = _validated_id(workflow_id)
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
+    workflow_payload = _workflow_action_payload(
+        body,
+        request,
+        operator,
+    )
+    payload = {
+        "operatorRef": operator,
+        **(
+            {
+                "expectedWorkflowCycle": (
+                    workflow_payload["expectedWorkflowCycle"]
+                )
+            }
+            if "expectedWorkflowCycle" in workflow_payload
+            else {}
+        ),
+    }
+    await asyncio.to_thread(_require_live_runtime)
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        _api_path("workflow_claim", workflow_id=workflow_id),
+        "POST",
+        payload,
+    )
+
+
+@router.post("/workflows/{workflow_id}/confirm-assignment")
+async def confirm_workflow_assignment(
+    workflow_id: str,
+    body: dict,
+    request: Request,
+):
+    workflow_id = _validated_id(workflow_id)
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
+    workflow_payload = _workflow_action_payload(
+        body,
+        request,
+        operator,
+    )
+    claim_token = workflow_payload.get("claimToken")
+    if (
+        not isinstance(claim_token, str)
+        or not _UUID_RE.fullmatch(claim_token)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid reservation",
+        )
+    payload = {
+        "operatorRef": operator,
+        "actorRef": workflow_payload["actorRef"],
+        "claimToken": claim_token,
+    }
+    await asyncio.to_thread(_require_live_runtime)
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        _api_path(
+            "workflow_confirm_assignment",
+            workflow_id=workflow_id,
+        ),
+        "POST",
+        payload,
+    )
+
+
+@router.post("/workflows/{workflow_id}/closure")
+async def decide_workflow_closure(
+    workflow_id: str,
+    body: dict,
+    request: Request,
+):
+    workflow_id = _validated_id(workflow_id)
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
+    decision = body.get("decision")
+    if decision not in {"CLOSE", "CONTINUE"}:
+        raise HTTPException(status_code=400, detail="Invalid closure decision")
+    workflow_payload = _workflow_action_payload(
+        body,
+        request,
+        operator,
+    )
+    payload = {
+        "actorRef": workflow_payload["actorRef"],
+        "expectedWorkflowCycle": workflow_payload.get(
+            "expectedWorkflowCycle"
+        ),
+        "decision": decision,
+    }
+    if isinstance(body.get("outcome"), str):
+        payload["outcome"] = body["outcome"][:4000]
+    if isinstance(body.get("nextCheckAt"), str):
+        payload["nextCheckAt"] = body["nextCheckAt"]
+    await asyncio.to_thread(_require_live_runtime)
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        _api_path("workflow_closure", workflow_id=workflow_id),
         "POST",
         payload,
     )
@@ -306,9 +745,11 @@ async def edit_action(action_id: str, body: dict, request: Request):
     }
     if "infoRequest" in body:
         payload["infoRequest"] = body["infoRequest"]
+    if isinstance(body.get("reason"), str):
+        payload["reason"] = body["reason"][:500]
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/action-cards/{action_id}/edit",
+        _api_path("action_edit", action_id=action_id),
         "POST",
         payload,
     )
@@ -329,7 +770,37 @@ async def decide_action(action_id: str, body: dict, request: Request):
         payload["externalRef"] = body["externalRef"][:500]
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/action-cards/{action_id}/decision",
+        _api_path("action_decision", action_id=action_id),
+        "POST",
+        payload,
+    )
+
+
+@router.post("/actions/{action_id}/outcome")
+async def record_action_outcome(
+    action_id: str,
+    body: dict,
+    request: Request,
+):
+    _require_oblist_operator(request)
+    action_id = _validated_id(action_id)
+    payload = {
+        "expectedVersion": body.get("expectedVersion"),
+        "actorRef": _actor_ref(request),
+        "episodeId": body.get("episodeId"),
+        "outcome": body.get("outcome"),
+        "attributable": body.get("attributable"),
+    }
+    for key in (
+        "attributionAmbiguous",
+        "precedentRevisionId",
+        "reason",
+    ):
+        if key in body:
+            payload[key] = body[key]
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        _api_path("action_outcome", action_id=action_id),
         "POST",
         payload,
     )
@@ -343,9 +814,16 @@ async def execute_action(action_id: str, body: dict, request: Request):
         "expectedVersion": body.get("expectedVersion"),
         "actorRef": _actor_ref(request),
     }
+    if isinstance(body.get("breakGlass"), dict):
+        if _session_email(request) not in _ADMIN_EMAILS:
+            raise HTTPException(
+                status_code=403,
+                detail="Break-glass is restricted to Gary",
+            )
+        payload["breakGlass"] = body["breakGlass"]
     return await asyncio.to_thread(
         _request_ai_ops,
-        f"/v1/action-cards/{action_id}/execute",
+        _api_path("action_execute", action_id=action_id),
         "POST",
         payload,
     )

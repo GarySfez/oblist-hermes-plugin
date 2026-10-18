@@ -19,13 +19,45 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
+const PLUGIN_VERSION = '0.4.0'
+const RELEASE_EPOCH = 'hermes-intelligence-v2'
+const API_PATHS = Object.freeze({
+  runtime: '/runtime',
+  action: actionId => `/actions/${actionId}`,
+  actionEdit: actionId => `/actions/${actionId}/edit`,
+  actionDecision: actionId => `/actions/${actionId}/decision`,
+  actionExecute: actionId => `/actions/${actionId}/execute`,
+  actionOutcome: actionId => `/actions/${actionId}/outcome`,
+  overview: '/overview',
+  notifications: '/notifications',
+  notificationInbox: '/notification-inbox',
+  notificationOutcome: notificationId =>
+    `/notifications/${notificationId}/outcome`,
+  notificationRead: notificationId =>
+    `/notifications/${notificationId}/read`,
+  workflowClaim: workflowId => `/workflows/${workflowId}/claim`,
+  workflowConfirmAssignment: workflowId =>
+    `/workflows/${workflowId}/confirm-assignment`,
+  workflowClosure: workflowId => `/workflows/${workflowId}/closure`
+})
+
+const V1_RUNTIME = Object.freeze({
+  mode: 'OFF',
+  releaseEpoch: null,
+  compatible: false,
+  fallback: 'V1'
+})
+
 const inFlightNotificationIds = new Set()
 const notificationPollRunning = new Set()
 const actionCardCache = new Map()
 const operationsOverviewCache = new Map()
 const operationsOverviewRequests = new Map()
+const runtimeHandshakeCache = new Map()
+const runtimeHandshakeRequests = new Map()
 const ACTION_CARD_CACHE_MS = 60_000
 const OPERATIONS_OVERVIEW_CACHE_MS = 90_000
+const RUNTIME_HANDSHAKE_CACHE_MS = 15_000
 const notificationInboxAtom = atom({
   activeOperator: '',
   byOperator: {
@@ -34,6 +66,11 @@ const notificationInboxAtom = atom({
     philippine: []
   }
 })
+const runtimeCompatibilityAtom = atom({
+  state: 'idle',
+  connectionKey: '',
+  runtime: V1_RUNTIME
+})
 
 function currentConnectionKey() {
   return String(
@@ -41,6 +78,93 @@ function currentConnectionKey() {
       host.activeConnectionId?.() ||
       'local'
   )
+}
+
+function normalizeRuntimeHandshake(value) {
+  const nested =
+    value?.runtime && typeof value.runtime === 'object'
+      ? value.runtime
+      : null
+  const source = nested ? { ...value, ...nested } : value || {}
+  const mode = ['OFF', 'SHADOW', 'LIVE'].includes(source.mode)
+    ? source.mode
+    : 'OFF'
+  const releaseEpoch =
+    typeof source.releaseEpoch === 'string' ? source.releaseEpoch : null
+  return {
+    mode,
+    releaseEpoch,
+    compatible:
+      source.compatible === true && releaseEpoch === RELEASE_EPOCH,
+    fallback: 'V1',
+    checkedAt:
+      Number.isFinite(Number(source.checkedAt))
+        ? Number(source.checkedAt)
+        : Date.now()
+  }
+}
+
+function isV2Live(runtime) {
+  return (
+    runtime?.mode === 'LIVE' &&
+    runtime?.compatible === true &&
+    runtime?.releaseEpoch === RELEASE_EPOCH
+  )
+}
+
+function runtimeBlocksV2(runtime) {
+  return runtime?.mode === 'LIVE' && !isV2Live(runtime)
+}
+
+async function refreshRuntimeHandshake(ctx, force = false) {
+  const connectionKey = currentConnectionKey()
+  const cached = runtimeHandshakeCache.get(connectionKey)
+  if (
+    !force &&
+    cached &&
+    Date.now() - cached.cachedAt < RUNTIME_HANDSHAKE_CACHE_MS
+  ) {
+    runtimeCompatibilityAtom.set({
+      state: 'ready',
+      connectionKey,
+      runtime: cached.runtime
+    })
+    return cached.runtime
+  }
+
+  let request = runtimeHandshakeRequests.get(connectionKey)
+  if (!request) {
+    request = ctx
+      .rest(API_PATHS.runtime, { timeoutMs: 10_000 })
+      .then(normalizeRuntimeHandshake)
+      .catch(() => ({ ...V1_RUNTIME, checkedAt: Date.now() }))
+      .finally(() => runtimeHandshakeRequests.delete(connectionKey))
+    runtimeHandshakeRequests.set(connectionKey, request)
+  }
+  runtimeCompatibilityAtom.set({
+    state: 'loading',
+    connectionKey,
+    runtime: cached?.runtime || V1_RUNTIME
+  })
+  const runtime = await request
+  runtimeHandshakeCache.set(connectionKey, {
+    runtime,
+    cachedAt: Date.now()
+  })
+  runtimeCompatibilityAtom.set({
+    state: 'ready',
+    connectionKey,
+    runtime
+  })
+  return runtime
+}
+
+function useRuntimeCompatibility(ctx) {
+  const compatibility = useValue(runtimeCompatibilityAtom)
+  useEffect(() => {
+    void refreshRuntimeHandshake(ctx)
+  }, [ctx])
+  return compatibility.runtime
 }
 
 const QUICK_PROMPT_USAGE_KEY = 'cs-quick-prompt-usage-v1'
@@ -93,6 +217,13 @@ const CS_QUICK_PROMPTS = [
     icon: 'package',
     text:
       'Montre-moi les demandes de devis de livraison de mon périmètre qui nécessitent une action, avec la prochaine étape recommandée.'
+  },
+  {
+    id: 'customs',
+    label: 'Dédouanements à suivre',
+    icon: 'globe',
+    text:
+      'Fais un point sur les commandes de mon périmètre en cours de dédouanement ou bloquées en douane. Indique les preuves disponibles, les inconnues et la prochaine action utile sans contacter personne.'
   }
 ]
 
@@ -171,6 +302,59 @@ const footerStyle = {
   borderTop: '1px solid var(--ui-stroke-secondary)'
 }
 
+function RuntimeCompatibilityStatus({ ctx }) {
+  const runtime = useRuntimeCompatibility(ctx)
+  if (runtimeBlocksV2(runtime)) {
+    return jsxs('div', {
+      role: 'alert',
+      style: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: '7px',
+        color: 'var(--ui-danger)',
+        fontSize: '12px',
+        lineHeight: 1.4
+      },
+      children: [
+        jsx(Codicon, { name: 'warning', size: '0.8rem' }),
+        jsx('span', {
+          children:
+            'Le suivi avancé attend une mise à jour. L’interface habituelle reste disponible.'
+        })
+      ]
+    })
+  }
+  return jsx('div', {
+    role: 'status',
+    style: {
+      display: 'flex',
+      justifyContent: 'center'
+    },
+    children: jsx(Badge, {
+      children: isV2Live(runtime)
+        ? 'Suivi avancé actif'
+        : 'Interface habituelle active'
+    })
+  })
+}
+
+function RuntimeActionBlock() {
+  return jsx('div', {
+    role: 'alert',
+    style: {
+      padding: '10px',
+      border: '1px solid var(--ui-danger)',
+      borderRadius: '8px',
+      color: 'var(--ui-danger)',
+      fontSize: '12px',
+      lineHeight: 1.45
+    },
+    children:
+      'Cette action est temporairement bloquée pour éviter une confirmation avec une version incompatible. Aucune action n’a été effectuée.'
+  })
+}
+
 async function openQuickPrompt(ctx, prompt) {
   await rememberQuickPrompt(ctx, prompt)
   host.navigate('/')
@@ -180,6 +364,17 @@ async function openQuickPrompt(ctx, prompt) {
     await host.composer.setDraft(sessionId, prompt.text)
     host.composer.focus(sessionId)
   })
+}
+
+async function requestActionCardRecheck(ctx) {
+  const sessionId =
+    host.state.focusedSessionId.get() ||
+    host.state.activeSessionId.get()
+  await host.composer.setDraft(
+    sessionId,
+    'Revérifie le brouillon que je viens de modifier. Récupère à nouveau tout le contexte actuel, contrôle chaque information sensible avec ses sources, puis lance la nouvelle vérification de la carte sans rien envoyer.'
+  )
+  host.composer.focus(sessionId)
 }
 
 function CsHomePage({ ctx }) {
@@ -218,8 +413,9 @@ function CsHomePage({ ctx }) {
             lineHeight: 1.5
           },
           children:
-            'Hermes peut analyser votre boîte de réception, rassembler le contexte d’un dossier et préparer les prochaines actions.'
+            'Vous pouvez me demander de retrouver une commande, analyser une conversation, vérifier une livraison ou un dédouanement, faire le point sur un retour, un remboursement ou un client VIP/VIC, puis préparer les prochaines actions sans rien envoyer sans votre accord.'
         }),
+        jsx(RuntimeCompatibilityStatus, { ctx }),
         jsx('div', {
           style: {
             display: 'flex',
@@ -247,6 +443,7 @@ function statusLabel(status) {
     REJECTED: 'Refusé',
     COPIED: 'Prêt dans Intercom',
     MONITORING: 'Suivi actif',
+    EXECUTING: 'En cours d’envoi',
     SENT: 'Envoyé',
     SUPERSEDED: 'Remplacé'
   }[status] || 'État inconnu'
@@ -257,6 +454,110 @@ function readableUiError(error, fallback) {
     error instanceof Error ? error.message.trim().slice(0, 180) : ''
   if (!detail || /[A-Z]{2,}_[A-Z_]+/.test(detail)) return fallback
   return `${fallback} ${detail}`
+}
+
+function normalizeCriticReview(card) {
+  const metadata = card?.metadata || {}
+  const raw =
+    card?.critic ||
+    card?.qualityReview ||
+    metadata.critic ||
+    metadata.qualityReview ||
+    (card?.criticVerdict || metadata.criticVerdict
+      ? {
+          verdict: card?.criticVerdict || metadata.criticVerdict,
+          cardVersion:
+            card?.criticCardVersion || metadata.criticCardVersion,
+          casePacketHash:
+            card?.casePacketHash || metadata.casePacketHash,
+          policyRevisionIds:
+            card?.policyRevisionIds || metadata.policyRevisionIds,
+          criticPromptVersion:
+            card?.criticPromptVersion || metadata.criticPromptVersion,
+          releaseEpoch:
+            card?.releaseEpoch || metadata.releaseEpoch
+        }
+      : null)
+  if (!raw || typeof raw !== 'object') return null
+  const verdict = ['PASS', 'REVISE', 'BLOCK'].includes(raw.verdict)
+    ? raw.verdict
+    : null
+  const cardVersion = Number(raw.cardVersion ?? raw.version)
+  const releaseEpoch =
+    typeof raw.releaseEpoch === 'string' ? raw.releaseEpoch : null
+  const casePacketHash =
+    typeof raw.casePacketHash === 'string' && raw.casePacketHash
+      ? raw.casePacketHash
+      : null
+  const policyRevisionIds = Array.isArray(raw.policyRevisionIds)
+    ? raw.policyRevisionIds
+    : null
+  const criticPromptVersion =
+    typeof raw.criticPromptVersion === 'string' &&
+    raw.criticPromptVersion
+      ? raw.criticPromptVersion
+      : null
+  return {
+    verdict,
+    cardVersion,
+    releaseEpoch,
+    current:
+      Boolean(verdict) &&
+      cardVersion === Number(card?.version) &&
+      releaseEpoch === RELEASE_EPOCH &&
+      Boolean(casePacketHash) &&
+      Boolean(policyRevisionIds) &&
+      Boolean(criticPromptVersion)
+  }
+}
+
+function criticAllowsAction(card, runtime, dirty = false) {
+  if (runtimeBlocksV2(runtime)) return false
+  if (!isV2Live(runtime)) return true
+  const review = normalizeCriticReview(card)
+  return !dirty && review?.current === true && review.verdict === 'PASS'
+}
+
+function CriticStatus({ card, runtime, dirty }) {
+  if (!isV2Live(runtime)) return null
+  if (dirty) {
+    return jsx('div', {
+      role: 'status',
+      style: {
+        color: 'var(--ui-text-secondary)',
+        fontSize: '12px',
+        lineHeight: 1.45
+      },
+      children:
+        'Les modifications devront être vérifiées avant toute confirmation.'
+    })
+  }
+  const review = normalizeCriticReview(card)
+  const passed = review?.current && review.verdict === 'PASS'
+  if (passed) {
+    return jsx('div', {
+      role: 'status',
+      children: jsx(Badge, { children: 'Vérification réussie' })
+    })
+  }
+  const message =
+    review?.current && review.verdict === 'REVISE'
+      ? 'Hermes doit corriger ce brouillon avant qu’il puisse être confirmé.'
+      : review?.current && review.verdict === 'BLOCK'
+        ? 'Cette action reste bloquée car une vérification a identifié un risque.'
+        : 'La vérification requise n’est pas disponible pour cette version du brouillon. Cette action reste bloquée.'
+  return jsx('div', {
+    role: 'alert',
+    style: {
+      padding: '9px 10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '8px',
+      color: 'var(--ui-text-secondary)',
+      fontSize: '12px',
+      lineHeight: 1.45
+    },
+    children: message
+  })
 }
 
 function bodyForEditor(value) {
@@ -274,6 +575,39 @@ function bodyForEditor(value) {
     .replace(/\n[ \t]+/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+function materialEdit(card, subject, body, infoRequest) {
+  if ((card?.subject || '').trim() !== String(subject || '').trim()) return true
+  if (
+    JSON.stringify(card?.metadata?.infoRequest || null) !==
+    JSON.stringify(infoRequest || null)
+  ) {
+    return true
+  }
+  const words = value =>
+    String(value || '')
+      .toLocaleLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+  const previous = words(bodyForEditor(card?.body))
+  const next = words(body)
+  const counts = new Map()
+  previous.forEach(word => counts.set(word, (counts.get(word) || 0) + 1))
+  let shared = 0
+  next.forEach(word => {
+    const remaining = counts.get(word) || 0
+    if (remaining < 1) return
+    shared += 1
+    counts.set(word, remaining - 1)
+  })
+  return (
+    (previous.length + next.length - 2 * shared) /
+      Math.max(1, previous.length + next.length) >=
+    0.25
+  )
 }
 
 function kindLabel(card) {
@@ -528,6 +862,7 @@ function InfoRequestFields({ value, onChange, disabled }) {
 }
 
 function ActionCard({ ctx, actionId, streaming }) {
+  const runtime = useRuntimeCompatibility(ctx)
   const actionCacheKey = `${currentConnectionKey()}:${actionId}`
   const cachedAction = actionCardCache.get(actionCacheKey)?.card || null
   const [card, setCard] = useState(cachedAction)
@@ -543,6 +878,9 @@ function ActionCard({ ctx, actionId, streaming }) {
   const [error, setError] = useState('')
   const [rejecting, setRejecting] = useState(false)
   const [rejectReason, setRejectReason] = useState('')
+  const [editReason, setEditReason] = useState('')
+  const [outcomeReason, setOutcomeReason] = useState('')
+  const [outcomeRecorded, setOutcomeRecorded] = useState('')
 
   const applyCard = useCallback((nextCard, cachedAt = Date.now()) => {
     actionCardCache.set(actionCacheKey, {
@@ -555,6 +893,7 @@ function ActionCard({ ctx, actionId, streaming }) {
     setInfoRequest(
       normalizeInfoRequest(nextCard.metadata?.infoRequest || null)
     )
+    setEditReason('')
   }, [actionCacheKey])
 
   const load = useCallback(async (force = false) => {
@@ -563,14 +902,27 @@ function ActionCard({ ctx, actionId, streaming }) {
     if (cached) {
       applyCard(cached.card, cached.cachedAt)
       setLoading(false)
-      if (!force && Date.now() - cached.cachedAt < ACTION_CARD_CACHE_MS) {
+      const needsLiveRefresh =
+        isV2Live(runtime) &&
+        (
+          normalizeCriticReview(cached.card)?.current !== true ||
+          (
+            cached.card?.status === 'SENT' &&
+            !UUID_RE.test(cached.card?.caseEpisodeId || '')
+          )
+        )
+      if (
+        !force &&
+        !needsLiveRefresh &&
+        Date.now() - cached.cachedAt < ACTION_CARD_CACHE_MS
+      ) {
         return
       }
     } else {
       setLoading(true)
     }
     try {
-      const result = await ctx.rest(`/actions/${actionId}`)
+      const result = await ctx.rest(API_PATHS.action(actionId))
       applyCard(result.card)
       setError('')
     } catch (loadError) {
@@ -583,15 +935,20 @@ function ActionCard({ ctx, actionId, streaming }) {
     } finally {
       setLoading(false)
     }
-  }, [actionCacheKey, actionId, applyCard, ctx])
+  }, [actionCacheKey, actionId, applyCard, ctx, runtime])
 
   useEffect(() => {
     void load()
   }, [load])
 
   useEffect(() => {
-    if (card?.status !== 'MONITORING') return undefined
-    const timer = window.setInterval(() => void load(true), 30_000)
+    if (!['MONITORING', 'EXECUTING'].includes(card?.status)) {
+      return undefined
+    }
+    const timer = window.setInterval(
+      () => void load(true),
+      card.status === 'EXECUTING' ? 5_000 : 30_000
+    )
     return () => window.clearInterval(timer)
   }, [card?.status, load])
 
@@ -608,18 +965,27 @@ function ActionCard({ ctx, actionId, streaming }) {
   )
 
   const canEdit = card && ['DRAFT', 'APPROVED'].includes(card.status)
+  const materialChange = useMemo(
+    () => Boolean(card && dirty && materialEdit(card, subject, body, infoRequest)),
+    [body, card, dirty, infoRequest, subject]
+  )
 
   const save = async () => {
     if (!card || !dirty || !body.trim()) return card
+    if (materialChange && !editReason.trim()) {
+      setError('Indiquez brièvement pourquoi cette modification est importante.')
+      return null
+    }
     setWorking('save')
     setError('')
     try {
-      const result = await ctx.rest(`/actions/${card.id}/edit`, {
+      const result = await ctx.rest(API_PATHS.actionEdit(card.id), {
         method: 'POST',
         body: {
           expectedVersion: card.version,
           subject: subject.trim() || null,
           body: body.trim(),
+          ...(editReason.trim() ? { reason: editReason.trim() } : {}),
           ...(infoRequest ? { infoRequest } : {})
         }
       })
@@ -643,10 +1009,19 @@ function ActionCard({ ctx, actionId, streaming }) {
       current = await save()
       if (!current) return null
     }
+    if (
+      decision !== 'REJECT' &&
+      !criticAllowsAction(current, runtime)
+    ) {
+      setError(
+        'Cette action reste bloquée tant que la vérification du brouillon n’est pas terminée.'
+      )
+      return null
+    }
     setWorking(decision)
     setError('')
     try {
-      const result = await ctx.rest(`/actions/${current.id}/decision`, {
+      const result = await ctx.rest(API_PATHS.actionDecision(current.id), {
         method: 'POST',
         body: {
           expectedVersion: current.version,
@@ -669,8 +1044,12 @@ function ActionCard({ ctx, actionId, streaming }) {
   }
 
   const reject = async () => {
+    if (!rejectReason.trim()) {
+      setError('Indiquez brièvement pourquoi ce brouillon est refusé.')
+      return
+    }
     const rejected = await decide('REJECT', {
-      reason: rejectReason.trim() || 'Refusé depuis Hermes Desktop'
+      reason: rejectReason.trim()
     })
     if (rejected) {
       host.notify({ kind: 'success', message: 'Action refusée' })
@@ -706,13 +1085,22 @@ function ActionCard({ ctx, actionId, streaming }) {
 
   const executeApproved = async approvedCard => {
     if (!approvedCard || approvedCard.status !== 'APPROVED') return
+    if (!criticAllowsAction(approvedCard, runtime)) {
+      setError(
+        'Cette action reste bloquée tant que la vérification du brouillon n’est pas terminée.'
+      )
+      return null
+    }
     setWorking('execute')
     setError('')
     try {
-      const result = await ctx.rest(`/actions/${approvedCard.id}/execute`, {
+      const result = await ctx.rest(
+        API_PATHS.actionExecute(approvedCard.id),
+        {
         method: 'POST',
         body: { expectedVersion: approvedCard.version }
-      })
+        }
+      )
       applyCard(result.card)
       const channel = result.execution.channel
       host.notify({
@@ -729,7 +1117,7 @@ function ActionCard({ ctx, actionId, streaming }) {
       setError(
         readableUiError(
           executeError,
-          "L’action approuvée n’a pas été confirmée. Vous pouvez réessayer sans risque de doublon.",
+          "L’action n’a pas été confirmée. Actualisez la carte et vérifiez Intercom ou Kepler avant toute nouvelle tentative.",
         )
       )
       return null
@@ -752,6 +1140,68 @@ function ActionCard({ ctx, actionId, streaming }) {
       return
     }
     host.notify({ kind: 'success', message: 'Action approuvée' })
+  }
+
+  const recordOutcome = async outcome => {
+    if (
+      !card ||
+      card.status !== 'SENT' ||
+      !UUID_RE.test(card.caseEpisodeId || '')
+    ) {
+      return
+    }
+    if (outcome === 'NEGATIVE' && !outcomeReason.trim()) {
+      setError(
+        'Indiquez brièvement ce qui reste à résoudre avant d’enregistrer ce retour.'
+      )
+      return
+    }
+    const precedentRevisionIds = Array.isArray(
+      card.metadata?.precedentRevisionIds
+    )
+      ? card.metadata.precedentRevisionIds.filter(value =>
+          UUID_RE.test(String(value || ''))
+        )
+      : []
+    setWorking(`outcome-${outcome}`)
+    setError('')
+    try {
+      await ctx.rest(API_PATHS.actionOutcome(card.id), {
+        method: 'POST',
+        body: {
+          expectedVersion: card.version,
+          episodeId: card.caseEpisodeId,
+          outcome,
+          attributable: true,
+          ...(precedentRevisionIds.length === 1
+            ? {
+                precedentRevisionId: precedentRevisionIds[0],
+                attributionAmbiguous: false
+              }
+            : {
+                attributionAmbiguous:
+                  precedentRevisionIds.length > 1
+              }),
+          ...(outcome === 'NEGATIVE'
+            ? { reason: outcomeReason.trim() }
+            : {})
+        }
+      })
+      setOutcomeRecorded(outcome)
+      host.notify({
+        kind: 'success',
+        message:
+          outcome === 'POSITIVE'
+            ? 'Résolution confirmée'
+            : 'Suivi à poursuivre enregistré'
+      })
+    } catch {
+      setError(
+        'Ce retour n’a pas pu être enregistré. Rechargez la carte puis réessayez.'
+      )
+    } finally {
+      setWorking('')
+    }
   }
 
   if (!UUID_RE.test(actionId)) return null
@@ -785,9 +1235,14 @@ function ActionCard({ ctx, actionId, streaming }) {
     })
   }
 
-  const finalState = ['REJECTED', 'MONITORING', 'SENT', 'SUPERSEDED'].includes(
-    card.status
-  )
+  const finalState = [
+    'EXECUTING',
+    'REJECTED',
+    'MONITORING',
+    'SENT',
+    'SUPERSEDED'
+  ].includes(card.status)
+  const actionAllowed = criticAllowsAction(card, runtime, dirty)
 
   return jsxs('section', {
     style: cardStyle,
@@ -856,6 +1311,16 @@ function ActionCard({ ctx, actionId, streaming }) {
               minHeight: '132px'
             }
           }),
+          materialChange
+            ? jsx(Input, {
+                value: editReason,
+                maxLength: 500,
+                disabled: !canEdit || Boolean(working),
+                placeholder: 'Pourquoi cette modification importante ?',
+                'aria-label': 'Raison de la modification importante',
+                onChange: event => setEditReason(event.target.value)
+              })
+            : null,
           card.rationale
             ? jsx('details', {
                 children: [
@@ -879,6 +1344,73 @@ function ActionCard({ ctx, actionId, streaming }) {
                 ]
               })
             : null,
+          isV2Live(runtime) &&
+          card.status === 'SENT' &&
+          UUID_RE.test(card.caseEpisodeId || '')
+            ? outcomeRecorded
+              ? jsx('div', {
+                  role: 'status',
+                  style: {
+                    color: 'var(--ui-text-secondary)',
+                    fontSize: '12px'
+                  },
+                  children:
+                    outcomeRecorded === 'POSITIVE'
+                      ? 'Vous avez confirmé que cette action a résolu le dossier.'
+                      : 'Vous avez indiqué que le suivi doit continuer.'
+                })
+              : jsxs('section', {
+                  'aria-label': 'Résultat de l’action',
+                  style: {
+                    display: 'grid',
+                    gap: '8px',
+                    padding: '10px',
+                    border: '1px solid var(--ui-stroke-secondary)',
+                    borderRadius: '8px'
+                  },
+                  children: [
+                    jsx('strong', {
+                      style: { fontSize: '12px' },
+                      children:
+                        'Cette action a-t-elle résolu le dossier ?'
+                    }),
+                    jsx(Input, {
+                      value: outcomeReason,
+                      maxLength: 2000,
+                      disabled: Boolean(working),
+                      placeholder:
+                        'Si le problème continue, indiquez brièvement pourquoi',
+                      'aria-label':
+                        'Raison pour laquelle le suivi doit continuer',
+                      onChange: event =>
+                        setOutcomeReason(event.target.value)
+                    }),
+                    jsxs('div', {
+                      style: rowStyle,
+                      children: [
+                        jsx(Button, {
+                          size: 'sm',
+                          disabled: Boolean(working),
+                          onClick: () =>
+                            void recordOutcome('POSITIVE'),
+                          children: 'Oui, solution confirmée'
+                        }),
+                        jsx(Button, {
+                          size: 'sm',
+                          variant: 'secondary',
+                          disabled:
+                            Boolean(working) ||
+                            !outcomeReason.trim(),
+                          onClick: () =>
+                            void recordOutcome('NEGATIVE'),
+                          children: 'Non, poursuivre le suivi'
+                        })
+                      ]
+                    })
+                  ]
+                })
+            : null,
+          jsx(CriticStatus, { card, runtime, dirty }),
           error
             ? jsx('div', {
                 role: 'alert',
@@ -898,7 +1430,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                 children: [
                   jsx(Input, {
                     value: rejectReason,
-                    placeholder: 'Pourquoi refusez-vous ce brouillon ? (facultatif)',
+                    placeholder: 'Pourquoi refusez-vous ce brouillon ?',
                     onChange: event => setRejectReason(event.target.value),
                     autoFocus: true
                   }),
@@ -908,7 +1440,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                       jsx(Button, {
                         size: 'sm',
                         onClick: reject,
-                        disabled: Boolean(working),
+                        disabled: Boolean(working) || !rejectReason.trim(),
                         children: 'Confirmer le refus'
                       }),
                       jsx(Button, {
@@ -943,11 +1475,27 @@ function ActionCard({ ctx, actionId, streaming }) {
                         : 'Enregistrer les modifications'
                   })
                 : null,
+              isV2Live(runtime) &&
+              canEdit &&
+              !dirty &&
+              !actionAllowed
+                ? jsx(Button, {
+                    size: 'sm',
+                    variant: 'secondary',
+                    onClick: () =>
+                      void requestActionCardRecheck(ctx),
+                    disabled: Boolean(working),
+                    children: 'Demander une nouvelle vérification'
+                  })
+                : null,
               card.status === 'DRAFT'
                 ? jsx(Button, {
                     size: 'sm',
                     onClick: approve,
-                    disabled: Boolean(working) || !body.trim(),
+                    disabled:
+                      Boolean(working) ||
+                      !body.trim() ||
+                      !actionAllowed,
                     children:
                       working === 'APPROVE' || working === 'execute'
                         ? 'Envoi…'
@@ -974,7 +1522,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                 ? jsx(Button, {
                     size: 'sm',
                     onClick: copyAndOpen,
-                    disabled: Boolean(working),
+                    disabled: Boolean(working) || !actionAllowed,
                     children:
                       card.kind === 'VENDOR_SIDE_CONVERSATION'
                         ? 'Copier et ouvrir Intercom'
@@ -990,7 +1538,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                 ? jsx(Button, {
                     size: 'sm',
                     onClick: () => executeApproved(card),
-                    disabled: Boolean(working),
+                    disabled: Boolean(working) || !actionAllowed,
                     children:
                       working === 'execute'
                         ? 'Envoi…'
@@ -1003,7 +1551,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                 ? jsx(Button, {
                     size: 'sm',
                     onClick: startMonitoring,
-                    disabled: Boolean(working),
+                    disabled: Boolean(working) || !actionAllowed,
                     children:
                       working === 'START_MONITORING'
                         ? 'Activation…'
@@ -1035,6 +1583,463 @@ function priorityLabel(priority) {
     MEDIUM: 'Priorité normale',
     LOW: 'Priorité faible'
   }[priority] || 'À évaluer'
+}
+
+const WORKFLOW_PHASE_LABELS = {
+  NEW: 'Nouveau dossier',
+  INVESTIGATING: 'Analyse en cours',
+  WAITING_CUSTOMER: 'En attente du client',
+  WAITING_VENDOR: 'En attente du vendeur',
+  WAITING_INTERNAL: 'En attente de l’équipe',
+  READY_TO_REPLY: 'Réponse à préparer',
+  MONITORING: 'Suivi en cours',
+  CLOSURE_CONFIRMATION: 'Clôture à confirmer'
+}
+
+function humanOwnerLabel(value) {
+  if (typeof value !== 'string' || !value.trim()) return 'Non attribué'
+  const normalized = value.trim()
+  if (normalized === 'lyse') return 'Lyse'
+  if (normalized === 'philippine') return 'Philippine'
+  return normalized.slice(0, 120)
+}
+
+function normalizeWorkflow(value) {
+  const nested =
+    value?.workflow ||
+    value?.caseWorkflow ||
+    value?.caseWatch ||
+    value?.watch ||
+    value?.payload?.workflow ||
+    value?.payload?.caseWorkflow ||
+    value?.payload?.situation?.workflow ||
+    value?.payload?.situation?.caseWorkflow
+  const raw =
+    nested && typeof nested === 'object'
+      ? nested
+      : value && typeof value === 'object'
+        ? value
+        : null
+  if (!raw) return null
+  const workflowId =
+    raw.id || raw.watchId || raw.caseWatchId || raw.workflowId
+  if (!UUID_RE.test(String(workflowId || ''))) return null
+
+  const claim =
+    raw.claim && typeof raw.claim === 'object' ? raw.claim : {}
+  const assignment =
+    raw.assignment && typeof raw.assignment === 'object'
+      ? raw.assignment
+      : {}
+  const closure =
+    raw.closure && typeof raw.closure === 'object' ? raw.closure : {}
+  const sla = raw.sla && typeof raw.sla === 'object' ? raw.sla : {}
+  const owner =
+    raw.owner && typeof raw.owner === 'object' ? raw.owner : {}
+  const capabilities =
+    raw.capabilities && typeof raw.capabilities === 'object'
+      ? raw.capabilities
+      : {}
+  const phase = String(
+    raw.phase || raw.workflowPhase || 'INVESTIGATING'
+  )
+  const ownerLabel = humanOwnerLabel(
+    owner.displayName ||
+      owner.label ||
+      raw.ownerLabel ||
+      raw.operatorName ||
+      raw.operatorRef
+  )
+  const claimExpiresAt =
+    claim.expiresAt || raw.claimExpiresAt || raw.reservationExpiresAt || null
+  const expectedVersion = Number(
+    raw.version ?? raw.workflowVersion ?? raw.expectedVersion
+  )
+  return {
+    id: String(workflowId),
+    version:
+      Number.isInteger(expectedVersion) && expectedVersion > 0
+        ? expectedVersion
+        : null,
+    phase,
+    phaseLabel:
+      WORKFLOW_PHASE_LABELS[phase] || 'Suivi du dossier',
+    ownerLabel,
+    nextAction:
+      typeof raw.nextAction === 'string'
+        ? raw.nextAction.slice(0, 500)
+        : typeof raw.nextAction?.label === 'string'
+          ? raw.nextAction.label.slice(0, 500)
+          : 'À préciser',
+    resolutionCriteria:
+      typeof raw.resolutionCriteria === 'string'
+        ? raw.resolutionCriteria.slice(0, 4000)
+        : null,
+    slaDueAt: sla.dueAt || raw.slaDueAt || raw.dueAt || null,
+    slaStatus: String(sla.status || raw.slaStatus || ''),
+    claimExpiresAt:
+      typeof claimExpiresAt === 'string' ? claimExpiresAt : null,
+    reservationRef:
+      typeof claim.reservationRef === 'string'
+        ? claim.reservationRef
+        : typeof raw.reservationRef === 'string'
+          ? raw.reservationRef
+          : null,
+    claimState: String(
+      claim.state || raw.claimState || raw.reservationState || ''
+    ),
+    claimOwnerLabel: humanOwnerLabel(
+      claim.owner?.displayName ||
+        claim.ownerLabel ||
+        claim.operatorName ||
+        claim.operatorRef
+    ),
+    assignmentConfirmationRequired:
+      assignment.confirmationRequired === true ||
+      raw.assignmentConfirmationRequired === true,
+    closureConfirmationRequired:
+      closure.confirmationRequired === true ||
+      closure.required === true ||
+      raw.closureConfirmationRequired === true ||
+      phase === 'CLOSURE_CONFIRMATION',
+    canClaim:
+      capabilities.claim === true || raw.canClaim === true,
+    canConfirmAssignment:
+      capabilities.confirmAssignment === true ||
+      raw.canConfirmAssignment === true,
+    canClose:
+      capabilities.close === true ||
+      closure.canClose === true ||
+      raw.canClose === true,
+    canContinue:
+      capabilities.continue === true ||
+      closure.canContinue === true ||
+      raw.canContinue === true
+  }
+}
+
+function usePrefersReducedMotion() {
+  const [reduced, setReduced] = useState(() =>
+    Boolean(
+      typeof window !== 'undefined' &&
+        window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    )
+  )
+  useEffect(() => {
+    const media = window.matchMedia?.(
+      '(prefers-reduced-motion: reduce)'
+    )
+    if (!media) return undefined
+    const update = event => setReduced(event.matches)
+    media.addEventListener?.('change', update)
+    return () => media.removeEventListener?.('change', update)
+  }, [])
+  return reduced
+}
+
+function useReservationCountdown(expiresAt) {
+  const reducedMotion = usePrefersReducedMotion()
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    if (!expiresAt) return undefined
+    const timer = window.setInterval(
+      () => setNow(Date.now()),
+      reducedMotion ? 60_000 : 1_000
+    )
+    return () => window.clearInterval(timer)
+  }, [expiresAt, reducedMotion])
+  const deadline = Date.parse(expiresAt || '')
+  return {
+    reducedMotion,
+    remainingMs: Number.isFinite(deadline)
+      ? Math.max(0, deadline - now)
+      : 0
+  }
+}
+
+function reservationCountdownLabel(remainingMs, reducedMotion) {
+  if (remainingMs <= 0) return 'Réservation expirée'
+  const totalSeconds = Math.ceil(remainingMs / 1_000)
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (reducedMotion) {
+    return `Réservé pour encore ${Math.max(1, Math.ceil(totalSeconds / 60))} min`
+  }
+  return `Réservé pour encore ${minutes} min ${String(seconds).padStart(2, '0')} s`
+}
+
+function parisDateTime(value) {
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return null
+  return new Intl.DateTimeFormat('fr-FR', {
+    timeZone: 'Europe/Paris',
+    dateStyle: 'short',
+    timeStyle: 'short'
+  }).format(date)
+}
+
+function slaLabel(workflow) {
+  const dueAt = parisDateTime(workflow.slaDueAt)
+  if (workflow.slaStatus === 'BREACHED') {
+    return dueAt
+      ? `Échéance dépassée depuis le ${dueAt}`
+      : 'Échéance dépassée'
+  }
+  if (workflow.slaStatus === 'DUE_SOON') {
+    return dueAt ? `À traiter avant le ${dueAt}` : 'À traiter bientôt'
+  }
+  return dueAt ? `À traiter avant le ${dueAt}` : 'Échéance à préciser'
+}
+
+async function requestWorkflowAction(
+  ctx,
+  workflow,
+  action,
+  operatorRef,
+  decision
+) {
+  const path = {
+    claim: API_PATHS.workflowClaim,
+    confirm: API_PATHS.workflowConfirmAssignment,
+    closure: API_PATHS.workflowClosure
+  }[action]
+  if (!path) throw new Error('Unsupported workflow action')
+  return ctx.rest(
+    `${path(workflow.id)}${operatorQuery(operatorRef)}`,
+    {
+      method: 'POST',
+      body: {
+        ...(workflow.version
+          ? { expectedVersion: workflow.version }
+          : {}),
+        ...(workflow.reservationRef
+          ? { reservationRef: workflow.reservationRef }
+          : {}),
+        ...(decision ? { decision } : {}),
+        ...(decision === 'CLOSE' && workflow.resolutionCriteria
+          ? { outcome: workflow.resolutionCriteria }
+          : {})
+      },
+      timeoutMs: 30_000
+    }
+  )
+}
+
+function WorkflowPanel({
+  ctx,
+  runtime,
+  source,
+  operatorRef,
+  onUpdated
+}) {
+  const normalized = useMemo(() => normalizeWorkflow(source), [source])
+  const [workflow, setWorkflow] = useState(normalized)
+  const [working, setWorking] = useState('')
+  const [error, setError] = useState('')
+  const countdown = useReservationCountdown(workflow?.claimExpiresAt)
+
+  useEffect(() => {
+    setWorkflow(normalized)
+  }, [normalized])
+
+  if (!workflow) return null
+  if (!isV2Live(runtime)) {
+    return runtimeBlocksV2(runtime) ? jsx(RuntimeActionBlock, {}) : null
+  }
+
+  const run = async (action, decision) => {
+    setWorking(action)
+    setError('')
+    try {
+      const result = await requestWorkflowAction(
+        ctx,
+        workflow,
+        action,
+        operatorRef,
+        decision
+      )
+      const next =
+        normalizeWorkflow(result?.workflow) ||
+        normalizeWorkflow(result?.caseWatch) ||
+        normalizeWorkflow(result)
+      if (next) setWorkflow(next)
+      onUpdated?.(next, result)
+      host.notify({
+        kind: 'success',
+        message:
+          action === 'claim'
+            ? 'Dossier réservé pour vous'
+            : action === 'confirm'
+              ? 'Attribution confirmée'
+              : decision === 'CLOSE'
+                ? 'Clôture confirmée'
+                : 'Le suivi continue'
+      })
+    } catch {
+      setError(
+        'Cette décision n’a pas pu être enregistrée. Aucune action n’a été effectuée.'
+      )
+    } finally {
+      setWorking('')
+    }
+  }
+
+  const reservationActive =
+    Boolean(workflow.claimExpiresAt) && countdown.remainingMs > 0
+  return jsxs('section', {
+    'aria-label': 'Suivi du dossier',
+    style: {
+      display: 'grid',
+      gap: '9px',
+      padding: '10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '9px',
+      background: 'var(--ui-bg-primary)'
+    },
+    children: [
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '8px',
+          flexWrap: 'wrap'
+        },
+        children: [
+          jsx('strong', {
+            style: { fontSize: '12px' },
+            children: workflow.phaseLabel
+          }),
+          reservationActive
+            ? jsx('span', {
+                role: 'timer',
+                'aria-label': 'Temps restant pour confirmer l’attribution',
+                style: {
+                  color: 'var(--ui-text-secondary)',
+                  fontSize: '11px',
+                  fontVariantNumeric: 'tabular-nums'
+                },
+                children: reservationCountdownLabel(
+                  countdown.remainingMs,
+                  countdown.reducedMotion
+                )
+              })
+            : null
+        ]
+      }),
+      jsxs('details', {
+        children: [
+          jsx('summary', {
+            style: {
+              cursor: 'pointer',
+              color: 'var(--ui-text-secondary)',
+              fontSize: '12px'
+            },
+            children: 'Voir le suivi du dossier'
+          }),
+          jsxs('dl', {
+            style: {
+              display: 'grid',
+              gridTemplateColumns: 'max-content minmax(0, 1fr)',
+              gap: '6px 10px',
+              margin: '9px 0 0',
+              color: 'var(--ui-text-secondary)',
+              fontSize: '12px',
+              lineHeight: 1.45
+            },
+            children: [
+              jsx('dt', { children: 'Responsable' }),
+              jsx('dd', {
+                style: { margin: 0 },
+                children: workflow.ownerLabel
+              }),
+              jsx('dt', { children: 'Prochaine action' }),
+              jsx('dd', {
+                style: { margin: 0 },
+                children: workflow.nextAction
+              }),
+              jsx('dt', { children: 'Échéance' }),
+              jsx('dd', {
+                style: { margin: 0 },
+                children: slaLabel(workflow)
+              }),
+              reservationActive
+                ? jsx('dt', { children: 'Réservation' })
+                : null,
+              reservationActive
+                ? jsx('dd', {
+                    style: { margin: 0 },
+                    children: workflow.claimOwnerLabel
+                  })
+                : null
+            ]
+          })
+        ]
+      }),
+      error
+        ? jsx('div', {
+            role: 'alert',
+            style: {
+              color: 'var(--ui-danger)',
+              fontSize: '12px',
+              lineHeight: 1.45
+            },
+            children: error
+          })
+        : null,
+      jsxs('div', {
+        style: rowStyle,
+        children: [
+          workflow.canClaim
+            ? jsx(Button, {
+                size: 'sm',
+                variant: 'secondary',
+                disabled: Boolean(working),
+                onClick: () => void run('claim'),
+                children:
+                  working === 'claim'
+                    ? 'Réservation…'
+                    : 'Prendre ce dossier'
+              })
+            : null,
+          workflow.assignmentConfirmationRequired &&
+          workflow.canConfirmAssignment
+            ? jsx(Button, {
+                size: 'sm',
+                disabled:
+                  Boolean(working) ||
+                  !reservationActive,
+                onClick: () => void run('confirm'),
+                children:
+                  working === 'confirm'
+                    ? 'Confirmation…'
+                    : 'Confirmer l’attribution'
+              })
+            : null,
+          workflow.closureConfirmationRequired && workflow.canClose
+            ? jsx(Button, {
+                size: 'sm',
+                disabled: Boolean(working),
+                onClick: () => void run('closure', 'CLOSE'),
+                children:
+                  working === 'closure'
+                    ? 'Confirmation…'
+                    : 'Clôturer'
+              })
+            : null,
+          workflow.closureConfirmationRequired && workflow.canContinue
+            ? jsx(Button, {
+                size: 'sm',
+                variant: 'secondary',
+                disabled: Boolean(working),
+                onClick: () => void run('closure', 'CONTINUE'),
+                children: 'Continuer le suivi'
+              })
+            : null
+        ]
+      })
+    ]
+  })
 }
 
 function resolutionPrompt(situation) {
@@ -1125,6 +2130,7 @@ function OperationsOverview({
   operatorRef,
   initialView
 }) {
+  const runtime = useRuntimeCompatibility(ctx)
   const defaultView =
     initialView ||
     (operatorRef ? 'MY_INBOX' : 'TEAM_SUPPORT')
@@ -1164,7 +2170,9 @@ function OperationsOverview({
       let request = operationsOverviewRequests.get(cacheKey)
       if (!request) {
         request = ctx
-          .rest(`/overview?${query}`, { timeoutMs: 60_000 })
+          .rest(`${API_PATHS.overview}?${query}`, {
+            timeoutMs: 60_000
+          })
           .finally(() => operationsOverviewRequests.delete(cacheKey))
         operationsOverviewRequests.set(cacheKey, request)
       }
@@ -1348,12 +2356,24 @@ function OperationsOverview({
                           children: information
                         })
                     ),
-                    jsx('span', {
-                      style: {
-                        color: 'var(--ui-text-tertiary)',
-                        fontSize: '11px'
-                      },
-                      children: situation.nextAction
+                    !isV2Live(runtime) || !normalizeWorkflow(situation)
+                      ? jsx('span', {
+                          style: {
+                            color: 'var(--ui-text-tertiary)',
+                            fontSize: '11px'
+                          },
+                          children: situation.nextAction
+                        })
+                      : null,
+                    jsx(WorkflowPanel, {
+                      ctx,
+                      runtime,
+                      source: situation,
+                      operatorRef,
+                      onUpdated: () => {
+                        operationsOverviewCache.delete(cacheKey)
+                        void load(true)
+                      }
                     }),
                     jsxs('div', {
                       style: {
@@ -1421,7 +2441,7 @@ async function refreshNotificationInbox(
   operator = currentNotificationScope().operator
 ) {
   const data = await ctx.rest(
-    `/notification-inbox${operatorQuery(operator)}`,
+    `${API_PATHS.notificationInbox}${operatorQuery(operator)}`,
     { timeoutMs: 20_000 }
   )
   const current = notificationInboxAtom.get()
@@ -1439,10 +2459,74 @@ async function refreshNotificationInbox(
 async function readNotification(ctx, notificationId) {
   const { operator } = currentNotificationScope()
   await ctx.rest(
-    `/notifications/${notificationId}/read${operatorQuery(operator)}`,
+    `${API_PATHS.notificationRead(notificationId)}${operatorQuery(operator)}`,
     { method: 'POST', body: {}, timeoutMs: 20_000 }
   )
   await refreshNotificationInbox(ctx, operator)
+}
+
+function closureNotificationPayload(notification) {
+  const payload = notification?.payload
+  if (
+    !['CLOSURE_CONFIRMATION', 'CLOSURE_CONFIRMATION_REMINDER'].includes(
+      payload?.eventKind
+    ) ||
+    !UUID_RE.test(payload?.watchId || '') ||
+    !Number.isInteger(payload?.workflowCycle)
+  ) {
+    return null
+  }
+  return payload
+}
+
+async function decideClosureNotification(ctx, notification, decision) {
+  const closure = closureNotificationPayload(notification)
+  if (!closure) throw new Error('INVALID_CLOSURE_NOTIFICATION')
+  const { operator } = currentNotificationScope()
+  await ctx.rest(
+    `${API_PATHS.workflowClosure(closure.watchId)}${operatorQuery(operator)}`,
+    {
+    method: 'POST',
+    body: {
+      expectedVersion: closure.workflowCycle,
+      decision,
+      ...(decision === 'CLOSE'
+        ? {
+            outcome:
+              closure.resolutionCriteria ||
+              'Clôture confirmée par l’opératrice'
+          }
+        : {})
+    },
+    timeoutMs: 20_000
+    }
+  )
+  await readNotification(ctx, notification.id)
+}
+
+async function claimNotificationWatch(ctx, notification) {
+  const payload = notification?.payload
+  if (!UUID_RE.test(payload?.watchId || '')) return null
+  const { operator } = currentNotificationScope()
+  const result = await ctx.rest(
+    `${API_PATHS.workflowClaim(payload.watchId)}${operatorQuery(operator)}`,
+    {
+    method: 'POST',
+    body: {
+      ...(Number.isInteger(payload.workflowCycle)
+        ? { expectedVersion: payload.workflowCycle }
+        : {})
+    },
+    timeoutMs: 20_000
+    }
+  )
+  await refreshNotificationInbox(ctx, operator)
+  host.notify({
+    kind: 'info',
+    message:
+      'Dossier réservé pendant 30 minutes. Confirmez l’attribution dans vos alertes avant de contacter le client.'
+  })
+  return result
 }
 
 async function pollDesktopNotifications(ctx) {
@@ -1452,7 +2536,7 @@ async function pollDesktopNotifications(ctx) {
   notificationPollRunning.add(operator)
   try {
     const query = operatorQuery(operator)
-    const data = await ctx.rest(`/notifications${query}`, {
+    const data = await ctx.rest(`${API_PATHS.notifications}${query}`, {
       timeoutMs: 20_000
     })
     const notifications = Array.isArray(data?.notifications)
@@ -1467,10 +2551,15 @@ async function pollDesktopNotifications(ctx) {
       }
       inFlightNotificationIds.add(notification.id)
       const situation = notification?.payload?.situation
+      const closure = closureNotificationPayload(notification)
       try {
-        if (!situation?.id) throw new Error('INVALID_SITUATION_PAYLOAD')
-        const resolve = () =>
-          openSituationChat(situation, operator || profile || undefined)
+        const resolve = async () => {
+          await claimNotificationWatch(ctx, notification)
+          return openSituationChat(
+            situation,
+            operator || profile || undefined
+          )
+        }
         host.notify({
           kind: 'info',
           message: `${notification.title} · ${notification.body}`
@@ -1478,29 +2567,59 @@ async function pollDesktopNotifications(ctx) {
         await ctx.os.notify({
           title: notification.title,
           body: notification.body,
-          onActivate: resolve,
-          actions: [
-            {
-              id: 'resolve-now',
-              label: 'Résoudre maintenant',
-              onAction: resolve
-            }
-          ]
+          ...(closure
+            ? {
+                onActivate: () => undefined,
+                actions: [
+                  {
+                    id: 'close-case',
+                    label: 'Clôturer',
+                    onAction: () =>
+                      decideClosureNotification(ctx, notification, 'CLOSE')
+                  },
+                  {
+                    id: 'continue-case',
+                    label: 'Continuer le suivi',
+                    onAction: () =>
+                      decideClosureNotification(
+                        ctx,
+                        notification,
+                        'CONTINUE'
+                      )
+                  }
+                ]
+              }
+            : situation?.id
+              ? {
+                onActivate: resolve,
+                actions: [
+                  {
+                    id: 'resolve-now',
+                    label: 'Résoudre maintenant',
+                    onAction: resolve
+                  }
+                ]
+                }
+              : {})
         })
         await ctx.rest(
-          `/notifications/${notification.id}/outcome${query}`,
+          `${API_PATHS.notificationOutcome(notification.id)}${query}`,
           {
             method: 'POST',
-            body: { outcome: 'DELIVERED' },
+            body: {
+              outcome: 'DELIVERED',
+              deliveryToken: notification.deliveryToken
+            },
             timeoutMs: 20_000
           }
         )
       } catch (deliveryError) {
         await ctx
-          .rest(`/notifications/${notification.id}/outcome${query}`, {
+          .rest(`${API_PATHS.notificationOutcome(notification.id)}${query}`, {
             method: 'POST',
             body: {
               outcome: 'RETRY',
+              deliveryToken: notification.deliveryToken,
               errorCode:
                 deliveryError instanceof Error
                   ? deliveryError.message.slice(0, 100)
@@ -1637,6 +2756,7 @@ function NotificationBanner() {
 }
 
 function NotificationInboxPage({ ctx }) {
+  const runtime = useRuntimeCompatibility(ctx)
   const inbox = useValue(notificationInboxAtom)
   const [working, setWorking] = useState('')
   const [refreshing, setRefreshing] = useState(false)
@@ -1692,6 +2812,7 @@ function NotificationInboxPage({ ctx }) {
     setWorking(notification.id)
     setError('')
     try {
+      await claimNotificationWatch(ctx, notification)
       await readNotification(ctx, notification.id)
       await openSituationChat(
         situation,
@@ -1702,6 +2823,24 @@ function NotificationInboxPage({ ctx }) {
         readableUiError(
           resolveError,
           'Cette notification n’a pas pu être ouverte.',
+        )
+      )
+    } finally {
+      setWorking('')
+    }
+  }
+
+  const decideClosure = async (notification, decision) => {
+    setWorking(notification.id)
+    setError('')
+    try {
+      await decideClosureNotification(ctx, notification, decision)
+      await refreshNotificationInbox(ctx, operator)
+    } catch (closureError) {
+      setError(
+        readableUiError(
+          closureError,
+          'La décision de clôture n’a pas pu être enregistrée.'
         )
       )
     } finally {
@@ -1779,6 +2918,7 @@ function NotificationInboxPage({ ctx }) {
             style: { display: 'grid', gap: '10px' },
             children: notifications.map(notification => {
               const situation = notification?.payload?.situation
+              const closure = closureNotificationPayload(notification)
               const priority =
                 notification?.payload?.priority || 'INFORMATION'
               return jsxs('article', {
@@ -1839,7 +2979,14 @@ function NotificationInboxPage({ ctx }) {
                             },
                             children: situation.summary
                           })
-                        : null
+                        : null,
+                      jsx(WorkflowPanel, {
+                        ctx,
+                        runtime,
+                        source: notification,
+                        operatorRef: operator,
+                        onUpdated: () => void refresh()
+                      })
                     ]
                   }),
                   jsxs('div', {
@@ -1876,6 +3023,28 @@ function NotificationInboxPage({ ctx }) {
                                     ? 'Ouverture…'
                                     : 'Résoudre maintenant'
                               })
+                            : null,
+                          closure
+                            ? jsx(Button, {
+                                size: 'sm',
+                                variant: 'secondary',
+                                disabled: working === notification.id,
+                                onClick: () =>
+                                  decideClosure(notification, 'CONTINUE'),
+                                children: 'Continuer le suivi'
+                              })
+                            : null,
+                          closure
+                            ? jsx(Button, {
+                                size: 'sm',
+                                disabled: working === notification.id,
+                                onClick: () =>
+                                  decideClosure(notification, 'CLOSE'),
+                                children:
+                                  working === notification.id
+                                    ? 'Enregistrement…'
+                                    : 'Clôturer'
+                              })
                             : null
                         ]
                       })
@@ -1892,6 +3061,7 @@ function NotificationInboxPage({ ctx }) {
 export default {
   id: 'oblist-action-cards',
   name: 'The Oblist Action Cards',
+  version: PLUGIN_VERSION,
   register(ctx) {
     ctx.register({
       id: 'oblist-cs-home-page',
@@ -1936,6 +3106,12 @@ export default {
       unsubscribeFocusedProfile()
       unsubscribeHomeProfile()
     })
+    void refreshRuntimeHandshake(ctx, true)
+    const runtimeTimer = window.setInterval(
+      () => void refreshRuntimeHandshake(ctx, true),
+      RUNTIME_HANDSHAKE_CACHE_MS
+    )
+    ctx.onDispose(() => window.clearInterval(runtimeTimer))
     syncActiveProfile()
     const notificationTimer = window.setInterval(
       () => void pollDesktopNotifications(ctx),
