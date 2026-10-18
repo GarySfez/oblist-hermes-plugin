@@ -13,8 +13,8 @@ authenticated Nous session and is checked again by AI Ops.
 ## Install source
 
 ```text
-GarySfez/oblist-ai-ops/hermes-plugin/oblist-action-cards
+GarySfez/oblist-hermes-plugin
 ```
 
-The repository is private. Use only an authenticated internal installation
-channel; never place a GitHub token in the URL or in Hermes configuration.
+The public distribution repository contains plugin code only. It contains no
+credentials, customer data, Kepler data or direct third-party access.
