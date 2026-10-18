@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +22,7 @@ _OPERATOR_BY_EMAIL = {
     "lyse@oblist.com": "lyse",
     "philippine@oblist.com": "philippine",
 }
+_IDENTITY_CACHE: dict[str, tuple[float, str]] = {}
 
 
 def _actor_ref(request: Request) -> str:
@@ -34,8 +36,44 @@ def _actor_ref(request: Request) -> str:
 def _session_email(request: Request) -> str:
     session = getattr(request.state, "session", None)
     email = str(getattr(session, "email", "") or "").strip().lower()
-    if not email:
+    if email:
+        return email
+    user_id = str(getattr(session, "user_id", "") or "").strip()
+    cached = _IDENTITY_CACHE.get(user_id)
+    if cached and cached[0] > time.time():
+        return cached[1]
+    access_token = str(getattr(session, "access_token", "") or "").strip()
+    if not access_token:
         raise HTTPException(status_code=401, detail="Authenticated email required")
+    portal_url = os.environ.get(
+        "HERMES_DASHBOARD_PORTAL_URL",
+        "https://portal.nousresearch.com",
+    ).rstrip("/")
+    account_request = urllib.request.Request(
+        f"{portal_url}/api/oauth/account",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(account_request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Authenticated identity unavailable",
+        ) from error
+    user = payload.get("user") if isinstance(payload, dict) else None
+    email = (
+        str(user.get("email") or "").strip().lower()
+        if isinstance(user, dict)
+        else ""
+    )
+    if not email:
+        raise HTTPException(status_code=403, detail="Account email unavailable")
+    _IDENTITY_CACHE[user_id] = (time.time() + 300, email)
     return email
 
 
