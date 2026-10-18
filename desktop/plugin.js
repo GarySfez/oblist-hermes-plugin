@@ -30,8 +30,6 @@ const notificationInboxAtom = atom({
   }
 })
 
-const INTRO_MESSAGE =
-  'Comment puis-je vous aider à résoudre un cas du service client aujourd’hui ?'
 const QUICK_PROMPT_USAGE_KEY = 'cs-quick-prompt-usage-v1'
 const CS_QUICK_PROMPTS = [
   {
@@ -57,58 +55,32 @@ const CS_QUICK_PROMPTS = [
   }
 ]
 
-function installCsIntroMessage() {
-  const originals = new Map()
-  let scheduled = false
-  const apply = () => {
-    const root = document.querySelector('[data-slot="aui_intro"]')
-    const tagline = root?.querySelector('p:not(.fit-text)')
-    if (!tagline) return
-    if (!originals.has(tagline)) originals.set(tagline, tagline.textContent)
-    if (tagline.textContent !== INTRO_MESSAGE) {
-      tagline.textContent = INTRO_MESSAGE
-    }
-  }
-  const observer = new MutationObserver(() => {
-    if (scheduled) return
-    scheduled = true
-    queueMicrotask(() => {
-      scheduled = false
-      apply()
-    })
-  })
-  apply()
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    characterData: true
-  })
-  return () => {
-    observer.disconnect()
-    for (const [element, original] of originals) {
-      if (element.isConnected) element.textContent = original
-    }
-  }
-}
-
-function quickPromptActions(ctx, busy) {
-  if (busy) return []
+function orderedQuickPrompts(ctx) {
   const usage = ctx.storage.get(QUICK_PROMPT_USAGE_KEY, {})
   return [...CS_QUICK_PROMPTS]
     .sort(
       (left, right) =>
         Number(usage?.[right.id] || 0) - Number(usage?.[left.id] || 0)
     )
+}
+
+async function rememberQuickPrompt(ctx, prompt) {
+  const latest = ctx.storage.get(QUICK_PROMPT_USAGE_KEY, {})
+  await ctx.storage.set(QUICK_PROMPT_USAGE_KEY, {
+    ...latest,
+    [prompt.id]: Number(latest?.[prompt.id] || 0) + 1
+  })
+}
+
+function quickPromptActions(ctx, busy) {
+  if (busy) return []
+  return orderedQuickPrompts(ctx)
     .map(prompt => ({
       id: `oblist-${prompt.id}`,
       label: prompt.label,
       icon: prompt.icon,
       run: async sessionId => {
-        const latest = ctx.storage.get(QUICK_PROMPT_USAGE_KEY, {})
-        await ctx.storage.set(QUICK_PROMPT_USAGE_KEY, {
-          ...latest,
-          [prompt.id]: Number(latest?.[prompt.id] || 0) + 1
-        })
+        await rememberQuickPrompt(ctx, prompt)
         await host.composer.setDraft(sessionId, prompt.text)
         host.composer.focus(sessionId)
       }
@@ -155,6 +127,75 @@ const footerStyle = {
   flexWrap: 'wrap',
   padding: '10px 14px',
   borderTop: '1px solid var(--ui-stroke-secondary)'
+}
+
+async function openQuickPrompt(ctx, prompt) {
+  await rememberQuickPrompt(ctx, prompt)
+  host.navigate('/')
+  queueMicrotask(async () => {
+    const sessionId =
+      host.state.focusedSessionId.get() || host.state.activeSessionId.get()
+    await host.composer.setDraft(sessionId, prompt.text)
+    host.composer.focus(sessionId)
+  })
+}
+
+function CsHomePage({ ctx }) {
+  const prompts = orderedQuickPrompts(ctx)
+  return jsx('main', {
+    style: {
+      minHeight: 'calc(100vh - 120px)',
+      display: 'grid',
+      placeItems: 'center',
+      padding: '28px'
+    },
+    children: jsxs('section', {
+      style: {
+        width: 'min(720px, 100%)',
+        display: 'grid',
+        gap: '18px',
+        textAlign: 'center'
+      },
+      children: [
+        jsx('h1', {
+          style: {
+            margin: 0,
+            color: 'var(--ui-text-primary)',
+            fontSize: '24px',
+            fontWeight: 650,
+            lineHeight: 1.25
+          },
+          children:
+            'Comment puis-je vous aider à résoudre un cas du service client aujourd’hui ?'
+        }),
+        jsx('p', {
+          style: {
+            margin: 0,
+            color: 'var(--ui-text-secondary)',
+            fontSize: '13px',
+            lineHeight: 1.5
+          },
+          children:
+            'Hermes peut analyser votre boîte de réception, rassembler le contexte d’un dossier et préparer les prochaines actions.'
+        }),
+        jsx('div', {
+          style: {
+            display: 'flex',
+            justifyContent: 'center',
+            gap: '8px',
+            flexWrap: 'wrap'
+          },
+          children: prompts.map(prompt =>
+            jsx(Button, {
+              variant: 'secondary',
+              onClick: () => void openQuickPrompt(ctx, prompt),
+              children: prompt.label
+            })
+          )
+        })
+      ]
+    })
+  })
 }
 
 function statusLabel(status) {
@@ -1735,8 +1776,28 @@ export default {
   id: 'oblist-action-cards',
   name: 'The Oblist Action Cards',
   register(ctx) {
-    const uninstallIntroMessage = installCsIntroMessage()
-    ctx.onDispose(uninstallIntroMessage)
+    ctx.register({
+      id: 'oblist-cs-home-page',
+      area: ROUTES_AREA,
+      data: { path: '/oblist-cs-home' },
+      render: () => jsx(CsHomePage, { ctx })
+    })
+    ctx.register({
+      id: 'oblist-cs-home-nav',
+      area: SIDEBAR_NAV_AREA,
+      order: 30,
+      data: {
+        path: '/oblist-cs-home',
+        label: 'Accueil CS',
+        codicon: 'home'
+      }
+    })
+    if (
+      !host.state.activeSessionId.get() &&
+      !host.state.focusedSessionId.get()
+    ) {
+      queueMicrotask(() => host.navigate('/oblist-cs-home'))
+    }
     ctx.register({
       id: 'oblist-cs-quick-prompts',
       area: COMPOSER_AREAS.microActions,
