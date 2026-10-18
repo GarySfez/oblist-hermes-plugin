@@ -210,6 +210,13 @@ function statusLabel(status) {
   }[status] || 'État inconnu'
 }
 
+function readableUiError(error, fallback) {
+  const detail =
+    error instanceof Error ? error.message.trim().slice(0, 180) : ''
+  if (!detail || /[A-Z]{2,}_[A-Z_]+/.test(detail)) return fallback
+  return `${fallback} ${detail}`
+}
+
 function kindLabel(card) {
   if (card?.metadata?.channel === 'KEPLER_INFO_REQUEST') {
     return "Demande d’information au vendeur"
@@ -484,12 +491,11 @@ function ActionCard({ ctx, actionId, streaming }) {
       )
       setError('')
     } catch (loadError) {
-      const detail =
-        loadError instanceof Error ? loadError.message.slice(0, 180) : ''
       setError(
-        detail
-          ? `Cette carte n’a pas pu être chargée : ${detail}`
-          : 'Cette carte n’a pas pu être chargée.'
+        readableUiError(
+          loadError,
+          'Cette carte n’a pas pu être chargée.',
+        )
       )
     } finally {
       setLoading(false)
@@ -642,14 +648,11 @@ function ActionCard({ ctx, actionId, streaming }) {
       })
       return result.card
     } catch (executeError) {
-      const detail =
-        executeError instanceof Error
-          ? executeError.message.slice(0, 180)
-          : ''
       setError(
-        detail
-          ? `L’action approuvée n’a pas été confirmée : ${detail}`
-          : "L’action approuvée n’a pas été confirmée. Vous pouvez réessayer sans risque de doublon."
+        readableUiError(
+          executeError,
+          "L’action approuvée n’a pas été confirmée. Vous pouvez réessayer sans risque de doublon.",
+        )
       )
       return null
     } finally {
@@ -1066,9 +1069,10 @@ function OperationsOverview({
       setError('')
     } catch (loadError) {
       setError(
-        loadError instanceof Error
-          ? loadError.message.slice(0, 220)
-          : 'La vue du service client est indisponible'
+        readableUiError(
+          loadError,
+          'La vue du service client est indisponible.',
+        )
       )
     } finally {
       setLoading(false)
@@ -1537,9 +1541,10 @@ function NotificationInboxPage({ ctx }) {
       setError('')
     } catch (refreshError) {
       setError(
-        refreshError instanceof Error
-          ? refreshError.message.slice(0, 180)
-          : 'La boîte de notifications est indisponible'
+        readableUiError(
+          refreshError,
+          'La boîte de notifications est indisponible.',
+        )
       )
     } finally {
       setRefreshing(false)
@@ -1561,9 +1566,10 @@ function NotificationInboxPage({ ctx }) {
       await readNotification(ctx, notification.id)
     } catch (readError) {
       setError(
-        readError instanceof Error
-          ? readError.message.slice(0, 180)
-          : 'Cette notification n’a pas pu être marquée comme lue'
+        readableUiError(
+          readError,
+          'Cette notification n’a pas pu être marquée comme lue.',
+        )
       )
     } finally {
       setWorking('')
@@ -1583,9 +1589,10 @@ function NotificationInboxPage({ ctx }) {
       )
     } catch (resolveError) {
       setError(
-        resolveError instanceof Error
-          ? resolveError.message.slice(0, 180)
-          : 'Cette notification n’a pas pu être ouverte'
+        readableUiError(
+          resolveError,
+          'Cette notification n’a pas pu être ouverte.',
+        )
       )
     } finally {
       setWorking('')
