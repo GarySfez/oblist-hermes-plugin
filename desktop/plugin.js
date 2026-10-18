@@ -21,6 +21,11 @@ const UUID_RE =
 
 const inFlightNotificationIds = new Set()
 const notificationPollRunning = new Set()
+const actionCardCache = new Map()
+const operationsOverviewCache = new Map()
+const operationsOverviewRequests = new Map()
+const ACTION_CARD_CACHE_MS = 60_000
+const OPERATIONS_OVERVIEW_CACHE_MS = 90_000
 const notificationInboxAtom = atom({
   activeOperator: '',
   byOperator: {
@@ -29,6 +34,14 @@ const notificationInboxAtom = atom({
     philippine: []
   }
 })
+
+function currentConnectionKey() {
+  return String(
+    host.state.connectionId?.get?.() ||
+      host.activeConnectionId?.() ||
+      'local'
+  )
+}
 
 const QUICK_PROMPT_USAGE_KEY = 'cs-quick-prompt-usage-v1'
 const CS_QUICK_PROMPTS = [
@@ -515,26 +528,50 @@ function InfoRequestFields({ value, onChange, disabled }) {
 }
 
 function ActionCard({ ctx, actionId, streaming }) {
-  const [card, setCard] = useState(null)
-  const [subject, setSubject] = useState('')
-  const [body, setBody] = useState('')
-  const [infoRequest, setInfoRequest] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const actionCacheKey = `${currentConnectionKey()}:${actionId}`
+  const cachedAction = actionCardCache.get(actionCacheKey)?.card || null
+  const [card, setCard] = useState(cachedAction)
+  const [subject, setSubject] = useState(cachedAction?.subject || '')
+  const [body, setBody] = useState(
+    bodyForEditor(cachedAction?.body)
+  )
+  const [infoRequest, setInfoRequest] = useState(
+    normalizeInfoRequest(cachedAction?.metadata?.infoRequest || null)
+  )
+  const [loading, setLoading] = useState(!cachedAction)
   const [working, setWorking] = useState('')
   const [error, setError] = useState('')
   const [rejecting, setRejecting] = useState(false)
   const [rejectReason, setRejectReason] = useState('')
 
-  const load = useCallback(async () => {
+  const applyCard = useCallback((nextCard, cachedAt = Date.now()) => {
+    actionCardCache.set(actionCacheKey, {
+      card: nextCard,
+      cachedAt
+    })
+    setCard(nextCard)
+    setSubject(nextCard.subject || '')
+    setBody(bodyForEditor(nextCard.body))
+    setInfoRequest(
+      normalizeInfoRequest(nextCard.metadata?.infoRequest || null)
+    )
+  }, [actionCacheKey])
+
+  const load = useCallback(async (force = false) => {
     if (!UUID_RE.test(actionId)) return
+    const cached = actionCardCache.get(actionCacheKey)
+    if (cached) {
+      applyCard(cached.card, cached.cachedAt)
+      setLoading(false)
+      if (!force && Date.now() - cached.cachedAt < ACTION_CARD_CACHE_MS) {
+        return
+      }
+    } else {
+      setLoading(true)
+    }
     try {
       const result = await ctx.rest(`/actions/${actionId}`)
-      setCard(result.card)
-      setSubject(result.card.subject || '')
-      setBody(bodyForEditor(result.card.body))
-      setInfoRequest(
-        normalizeInfoRequest(result.card.metadata?.infoRequest || null)
-      )
+      applyCard(result.card)
       setError('')
     } catch (loadError) {
       setError(
@@ -546,15 +583,15 @@ function ActionCard({ ctx, actionId, streaming }) {
     } finally {
       setLoading(false)
     }
-  }, [actionId, ctx])
+  }, [actionCacheKey, actionId, applyCard, ctx])
 
   useEffect(() => {
-    load()
+    void load()
   }, [load])
 
   useEffect(() => {
     if (card?.status !== 'MONITORING') return undefined
-    const timer = window.setInterval(load, 30_000)
+    const timer = window.setInterval(() => void load(true), 30_000)
     return () => window.clearInterval(timer)
   }, [card?.status, load])
 
@@ -586,12 +623,7 @@ function ActionCard({ ctx, actionId, streaming }) {
           ...(infoRequest ? { infoRequest } : {})
         }
       })
-      setCard(result.card)
-      setSubject(result.card.subject || '')
-      setBody(bodyForEditor(result.card.body))
-      setInfoRequest(
-        normalizeInfoRequest(result.card.metadata?.infoRequest || null)
-      )
+      applyCard(result.card)
       host.notify({ kind: 'success', message: 'Brouillon enregistré' })
       return result.card
     } catch {
@@ -622,7 +654,7 @@ function ActionCard({ ctx, actionId, streaming }) {
           ...options
         }
       })
-      setCard(result.card)
+      applyCard(result.card)
       setRejecting(false)
       setRejectReason('')
       return result.card
@@ -681,7 +713,7 @@ function ActionCard({ ctx, actionId, streaming }) {
         method: 'POST',
         body: { expectedVersion: approvedCard.version }
       })
-      setCard(result.card)
+      applyCard(result.card)
       const channel = result.execution.channel
       host.notify({
         kind: 'success',
@@ -745,7 +777,7 @@ function ActionCard({ ctx, actionId, streaming }) {
           jsx(Button, {
             size: 'sm',
             variant: 'secondary',
-            onClick: load,
+            onClick: () => void load(true),
             children: 'Réessayer'
           })
         ]
@@ -1097,19 +1129,49 @@ function OperationsOverview({
     initialView ||
     (operatorRef ? 'MY_INBOX' : 'TEAM_SUPPORT')
   const [activeView, setActiveView] = useState(defaultView)
-  const [overview, setOverview] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const cacheKey = `${currentConnectionKey()}:${
+    operatorRef || 'global'
+  }:${activeView}`
+  const initialCache = operationsOverviewCache.get(cacheKey)
+  const [overview, setOverview] = useState(
+    initialCache?.overview || null
+  )
+  const [loading, setLoading] = useState(!initialCache)
+  const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (force = false) => {
+    const cached = operationsOverviewCache.get(cacheKey)
+    if (cached) {
+      setOverview(cached.overview)
+      setLoading(false)
+      if (
+        !force &&
+        Date.now() - cached.cachedAt < OPERATIONS_OVERVIEW_CACHE_MS
+      ) {
+        return
+      }
+      setRefreshing(true)
+    } else {
+      setOverview(null)
+      setLoading(true)
+    }
     try {
       const query = new URLSearchParams({
         view: activeView,
         ...(operatorRef ? { operator: operatorRef } : {})
       }).toString()
-      const result = await ctx.rest(`/overview?${query}`, {
-        timeoutMs: 60_000
+      let request = operationsOverviewRequests.get(cacheKey)
+      if (!request) {
+        request = ctx
+          .rest(`/overview?${query}`, { timeoutMs: 60_000 })
+          .finally(() => operationsOverviewRequests.delete(cacheKey))
+        operationsOverviewRequests.set(cacheKey, request)
+      }
+      const result = await request
+      operationsOverviewCache.set(cacheKey, {
+        overview: result,
+        cachedAt: Date.now()
       })
       setOverview(result)
       setError('')
@@ -1122,11 +1184,12 @@ function OperationsOverview({
       )
     } finally {
       setLoading(false)
+      setRefreshing(false)
     }
-  }, [activeView, ctx, operatorRef])
+  }, [activeView, cacheKey, ctx, operatorRef])
 
   useEffect(() => {
-    load()
+    void load()
   }, [load])
 
   const resolveNow = async situation => {
@@ -1137,7 +1200,7 @@ function OperationsOverview({
     await openSituationChat(situation, profile)
   }
 
-  if (streaming || loading) {
+  if ((streaming || loading) && !overview) {
     return jsx('section', {
       style: cardStyle,
       children: jsx('div', {
@@ -1160,7 +1223,7 @@ function OperationsOverview({
           jsx(Button, {
             size: 'sm',
             variant: 'secondary',
-            onClick: load,
+            onClick: () => void load(true),
             children: 'Réessayer'
           })
         ]
@@ -1194,8 +1257,9 @@ function OperationsOverview({
           jsx(Button, {
             size: 'sm',
             variant: 'secondary',
-            onClick: load,
-            children: 'Actualiser'
+            onClick: () => void load(true),
+            disabled: refreshing,
+            children: refreshing ? 'Actualisation…' : 'Actualiser'
           })
         ]
       }),
