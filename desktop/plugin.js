@@ -52,6 +52,34 @@ const CS_QUICK_PROMPTS = [
     icon: 'sparkle',
     text:
       'Aide-moi à résoudre ce cas avec tout le contexte disponible. Ne me demande pas une information que tu peux retrouver : '
+  },
+  {
+    id: 'priority-customers',
+    label: 'Clients VIP et VIC',
+    icon: 'star',
+    text:
+      'Fais un point sur les situations actives de mes clients VIP et VIC. Reste dans mon périmètre, classe les dossiers par urgence et propose le suivi utile sans envoyer de message.'
+  },
+  {
+    id: 'returns',
+    label: 'Retours à suivre',
+    icon: 'package',
+    text:
+      'Fais un point sur les retours qui demandent mon attention, en commençant par les urgences et les dossiers bloqués. Ne demande pas de numéro de commande.'
+  },
+  {
+    id: 'vendor-replies',
+    label: 'Réponses vendeurs',
+    icon: 'comment-discussion',
+    text:
+      'Montre-moi les dossiers de mon périmètre où un vendeur a répondu ou doit être relancé. Vérifie les Info Requests existantes pour éviter tout doublon.'
+  },
+  {
+    id: 'shipping-quotes',
+    label: 'Devis de livraison',
+    icon: 'package',
+    text:
+      'Montre-moi les demandes de devis de livraison de mon périmètre qui nécessitent une action, avec la prochaine étape recommandée.'
   }
 ]
 
@@ -75,6 +103,7 @@ async function rememberQuickPrompt(ctx, prompt) {
 function quickPromptActions(ctx, busy) {
   if (busy) return []
   return orderedQuickPrompts(ctx)
+    .slice(0, 3)
     .map(prompt => ({
       id: `oblist-${prompt.id}`,
       label: prompt.label,
@@ -208,6 +237,30 @@ function statusLabel(status) {
     SENT: 'Envoyé',
     SUPERSEDED: 'Remplacé'
   }[status] || 'État inconnu'
+}
+
+function readableUiError(error, fallback) {
+  const detail =
+    error instanceof Error ? error.message.trim().slice(0, 180) : ''
+  if (!detail || /[A-Z]{2,}_[A-Z_]+/.test(detail)) return fallback
+  return `${fallback} ${detail}`
+}
+
+function bodyForEditor(value) {
+  return String(value || '')
+    .replace(/<\/(?:p|div|h[1-6]|li|blockquote|section|article)>/gi, '\n\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
 
 function kindLabel(card) {
@@ -478,18 +531,17 @@ function ActionCard({ ctx, actionId, streaming }) {
       const result = await ctx.rest(`/actions/${actionId}`)
       setCard(result.card)
       setSubject(result.card.subject || '')
-      setBody(result.card.body || '')
+      setBody(bodyForEditor(result.card.body))
       setInfoRequest(
         normalizeInfoRequest(result.card.metadata?.infoRequest || null)
       )
       setError('')
     } catch (loadError) {
-      const detail =
-        loadError instanceof Error ? loadError.message.slice(0, 180) : ''
       setError(
-        detail
-          ? `Cette carte n’a pas pu être chargée : ${detail}`
-          : 'Cette carte n’a pas pu être chargée.'
+        readableUiError(
+          loadError,
+          'Cette carte n’a pas pu être chargée.',
+        )
       )
     } finally {
       setLoading(false)
@@ -511,7 +563,7 @@ function ActionCard({ ctx, actionId, streaming }) {
       Boolean(
         card &&
           ((card.subject || '') !== subject ||
-            (card.body || '') !== body ||
+            bodyForEditor(card.body) !== body ||
             JSON.stringify(card.metadata?.infoRequest || null) !==
               JSON.stringify(infoRequest))
       ),
@@ -536,7 +588,7 @@ function ActionCard({ ctx, actionId, streaming }) {
       })
       setCard(result.card)
       setSubject(result.card.subject || '')
-      setBody(result.card.body || '')
+      setBody(bodyForEditor(result.card.body))
       setInfoRequest(
         normalizeInfoRequest(result.card.metadata?.infoRequest || null)
       )
@@ -596,7 +648,7 @@ function ActionCard({ ctx, actionId, streaming }) {
   const copyAndOpen = async () => {
     const copied = await decide('COPY')
     if (!copied) return
-    await ctx.os.writeClipboard(copied.body)
+    await ctx.os.writeClipboard(bodyForEditor(copied.body))
     const conversationUrl = copied.metadata?.conversationUrl
     if (typeof conversationUrl === 'string' && conversationUrl) {
       await ctx.os.openExternal(conversationUrl)
@@ -642,14 +694,11 @@ function ActionCard({ ctx, actionId, streaming }) {
       })
       return result.card
     } catch (executeError) {
-      const detail =
-        executeError instanceof Error
-          ? executeError.message.slice(0, 180)
-          : ''
       setError(
-        detail
-          ? `L’action approuvée n’a pas été confirmée : ${detail}`
-          : "L’action approuvée n’a pas été confirmée. Vous pouvez réessayer sans risque de doublon."
+        readableUiError(
+          executeError,
+          "L’action approuvée n’a pas été confirmée. Vous pouvez réessayer sans risque de doublon.",
+        )
       )
       return null
     } finally {
@@ -1066,9 +1115,10 @@ function OperationsOverview({
       setError('')
     } catch (loadError) {
       setError(
-        loadError instanceof Error
-          ? loadError.message.slice(0, 220)
-          : 'La vue du service client est indisponible'
+        readableUiError(
+          loadError,
+          'La vue du service client est indisponible.',
+        )
       )
     } finally {
       setLoading(false)
@@ -1537,9 +1587,10 @@ function NotificationInboxPage({ ctx }) {
       setError('')
     } catch (refreshError) {
       setError(
-        refreshError instanceof Error
-          ? refreshError.message.slice(0, 180)
-          : 'La boîte de notifications est indisponible'
+        readableUiError(
+          refreshError,
+          'La boîte de notifications est indisponible.',
+        )
       )
     } finally {
       setRefreshing(false)
@@ -1561,9 +1612,10 @@ function NotificationInboxPage({ ctx }) {
       await readNotification(ctx, notification.id)
     } catch (readError) {
       setError(
-        readError instanceof Error
-          ? readError.message.slice(0, 180)
-          : 'Cette notification n’a pas pu être marquée comme lue'
+        readableUiError(
+          readError,
+          'Cette notification n’a pas pu être marquée comme lue.',
+        )
       )
     } finally {
       setWorking('')
@@ -1583,9 +1635,10 @@ function NotificationInboxPage({ ctx }) {
       )
     } catch (resolveError) {
       setError(
-        resolveError instanceof Error
-          ? resolveError.message.slice(0, 180)
-          : 'Cette notification n’a pas pu être ouverte'
+        readableUiError(
+          resolveError,
+          'Cette notification n’a pas pu être ouverte.',
+        )
       )
     } finally {
       setWorking('')
