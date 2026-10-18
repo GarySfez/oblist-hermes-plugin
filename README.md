@@ -16,5 +16,11 @@ authenticated Nous session and is checked again by AI Ops.
 GarySfez/oblist-hermes-plugin
 ```
 
+One-click Desktop installer:
+
+```text
+https://garysfez.github.io/oblist-hermes-plugin/
+```
+
 The public distribution repository contains plugin code only. It contains no
 credentials, customer data, Kepler data or direct third-party access.
