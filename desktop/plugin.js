@@ -30,6 +30,91 @@ const notificationInboxAtom = atom({
   }
 })
 
+const INTRO_MESSAGE =
+  'Comment puis-je vous aider à résoudre un cas du service client aujourd’hui ?'
+const QUICK_PROMPT_USAGE_KEY = 'cs-quick-prompt-usage-v1'
+const CS_QUICK_PROMPTS = [
+  {
+    id: 'priorities',
+    label: 'Priorités du jour',
+    icon: 'list-ordered',
+    text:
+      'Quelles situations méritent réellement mon attention aujourd’hui ? Classe-les par priorité et propose la prochaine action utile.'
+  },
+  {
+    id: 'inbox',
+    label: 'Ma boîte de réception',
+    icon: 'inbox',
+    text:
+      'Regarde ma boîte de réception, classe les dossiers qui demandent une action et affiche la liste interactive. N’envoie aucun message.'
+  },
+  {
+    id: 'resolve',
+    label: 'Résoudre un cas',
+    icon: 'sparkle',
+    text:
+      'Aide-moi à résoudre ce cas avec tout le contexte disponible. Ne me demande pas une information que tu peux retrouver : '
+  }
+]
+
+function installCsIntroMessage() {
+  const originals = new Map()
+  let scheduled = false
+  const apply = () => {
+    const root = document.querySelector('[data-slot="aui_intro"]')
+    const tagline = root?.querySelector('p:not(.fit-text)')
+    if (!tagline) return
+    if (!originals.has(tagline)) originals.set(tagline, tagline.textContent)
+    if (tagline.textContent !== INTRO_MESSAGE) {
+      tagline.textContent = INTRO_MESSAGE
+    }
+  }
+  const observer = new MutationObserver(() => {
+    if (scheduled) return
+    scheduled = true
+    queueMicrotask(() => {
+      scheduled = false
+      apply()
+    })
+  })
+  apply()
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true
+  })
+  return () => {
+    observer.disconnect()
+    for (const [element, original] of originals) {
+      if (element.isConnected) element.textContent = original
+    }
+  }
+}
+
+function quickPromptActions(ctx, busy) {
+  if (busy) return []
+  const usage = ctx.storage.get(QUICK_PROMPT_USAGE_KEY, {})
+  return [...CS_QUICK_PROMPTS]
+    .sort(
+      (left, right) =>
+        Number(usage?.[right.id] || 0) - Number(usage?.[left.id] || 0)
+    )
+    .map(prompt => ({
+      id: `oblist-${prompt.id}`,
+      label: prompt.label,
+      icon: prompt.icon,
+      run: async sessionId => {
+        const latest = ctx.storage.get(QUICK_PROMPT_USAGE_KEY, {})
+        await ctx.storage.set(QUICK_PROMPT_USAGE_KEY, {
+          ...latest,
+          [prompt.id]: Number(latest?.[prompt.id] || 0) + 1
+        })
+        await host.composer.setDraft(sessionId, prompt.text)
+        host.composer.focus(sessionId)
+      }
+    }))
+}
+
 const cardStyle = {
   width: 'min(720px, 100%)',
   border: '1px solid var(--ui-stroke-secondary)',
@@ -74,91 +159,100 @@ const footerStyle = {
 
 function statusLabel(status) {
   return {
-    DRAFT: 'Needs review',
-    APPROVED: 'Approved',
-    REJECTED: 'Rejected',
-    COPIED: 'Ready in Intercom',
-    MONITORING: 'Monitoring replies',
-    SENT: 'Sent',
-    SUPERSEDED: 'Superseded'
-  }[status] || status
+    DRAFT: 'À vérifier',
+    APPROVED: 'Approuvé',
+    REJECTED: 'Refusé',
+    COPIED: 'Prêt dans Intercom',
+    MONITORING: 'Suivi actif',
+    SENT: 'Envoyé',
+    SUPERSEDED: 'Remplacé'
+  }[status] || 'État inconnu'
 }
 
 function kindLabel(card) {
   if (card?.metadata?.channel === 'KEPLER_INFO_REQUEST') {
-    return 'Vendor Info Request'
+    return "Demande d’information au vendeur"
   }
   if (card?.metadata?.channel === 'INTERCOM_VENDOR_EMAIL') {
-    return 'Vendor email via Intercom'
+    return 'E-mail au vendeur via Intercom'
   }
   return card?.kind === 'CUSTOMER_REPLY'
-    ? 'Customer reply'
-    : 'Vendor side conversation'
+    ? 'Réponse au client'
+    : 'Demande au vendeur'
 }
 
 function approvalLabel(card) {
   return {
-    INTERCOM_CUSTOMER_REPLY: 'Approve & send in Intercom',
-    INTERCOM_VENDOR_EMAIL: 'Approve & send vendor email',
-    KEPLER_INFO_REQUEST: 'Approve & create Info Request',
-    INTERCOM_SIDE_CONVERSATION: 'Approve vendor draft'
-  }[card?.metadata?.channel] || 'Approve'
+    INTERCOM_CUSTOMER_REPLY: 'Approuver et envoyer dans Intercom',
+    INTERCOM_VENDOR_EMAIL: "Approuver et envoyer l’e-mail",
+    KEPLER_INFO_REQUEST: "Approuver et créer l’Info Request",
+    INTERCOM_SIDE_CONVERSATION: 'Approuver le brouillon vendeur'
+  }[card?.metadata?.channel] || 'Approuver'
 }
 
 function executionLabel(card) {
   return {
-    INTERCOM_CUSTOMER_REPLY: 'Send reply in Intercom',
-    INTERCOM_VENDOR_EMAIL: 'Send vendor email',
-    KEPLER_INFO_REQUEST: 'Create & send Info Request'
-  }[card?.metadata?.channel] || 'Execute approved action'
+    INTERCOM_CUSTOMER_REPLY: 'Envoyer la réponse dans Intercom',
+    INTERCOM_VENDOR_EMAIL: "Envoyer l’e-mail au vendeur",
+    KEPLER_INFO_REQUEST: "Créer et envoyer l’Info Request"
+  }[card?.metadata?.channel] || "Exécuter l’action approuvée"
 }
 
 const INFO_REQUEST_OPTIONS = {
   PRODUCT: [
-    ['MISSING_DIMENSIONS', 'Missing dimensions'],
-    ['MISSING_MATERIALS', 'Materials not specified'],
-    ['MISSING_WEIGHT', 'Weight missing'],
-    ['WRONG_CATEGORY', 'Wrong product category'],
-    ['LOW_QUALITY_PHOTOS', 'Photos too low resolution'],
-    ['MISSING_LIFESTYLE', 'Need lifestyle photos'],
-    ['MISSING_DESCRIPTION', 'Description missing'],
-    ['PRICE_INCONSISTENT', 'Price seems inconsistent']
+    ['MISSING_DIMENSIONS', 'Dimensions manquantes'],
+    ['MISSING_MATERIALS', 'Matériaux non précisés'],
+    ['MISSING_WEIGHT', 'Poids manquant'],
+    ['WRONG_CATEGORY', 'Catégorie produit incorrecte'],
+    ['LOW_QUALITY_PHOTOS', 'Photos de qualité insuffisante'],
+    ['MISSING_LIFESTYLE', "Photos d’ambiance nécessaires"],
+    ['MISSING_DESCRIPTION', 'Description manquante'],
+    ['PRICE_INCONSISTENT', 'Prix à vérifier']
   ],
   VENDOR: [
-    ['MISSING_VAT', 'VAT number missing or invalid'],
-    ['MISSING_LOGO', 'Brand logo missing or low quality'],
-    ['MISSING_BRAND_DESC', 'Brand description missing'],
-    ['OUTDATED_ADDRESS', 'Address seems outdated'],
-    ['BRAND_HANDLE_ISSUE', 'Brand handle / URL issue'],
-    ['TERMS_REACCEPT', 'Re-accept updated terms']
+    ['MISSING_VAT', 'Numéro de TVA manquant ou invalide'],
+    ['MISSING_LOGO', 'Logo de marque manquant ou inexploitable'],
+    ['MISSING_BRAND_DESC', 'Description de marque manquante'],
+    ['OUTDATED_ADDRESS', 'Adresse à mettre à jour'],
+    ['BRAND_HANDLE_ISSUE', 'Adresse web de la marque à corriger'],
+    ['TERMS_REACCEPT', 'Nouvelles conditions à accepter']
   ],
   ORDER: [
-    ['REQUEST_SHIPPING_QUOTE', 'Request a shipping quote'],
-    ['MISSING_TRACKING', 'Tracking number missing'],
-    ['WRONG_TRACKING', 'Tracking number invalid'],
-    ['CONTACT_CARRIER_STATUS', 'Contact carrier for status'],
-    ['MISSING_INVOICE', 'Vendor invoice missing'],
-    ['SHIPPING_DELAYED', 'Shipping delayed'],
-    ['PACKAGING_PROOF', 'Send packaged-item photo'],
-    ['FULFILLMENT_CONFIRM', 'Confirm fulfillment status'],
+    ['REQUEST_SHIPPING_QUOTE', 'Demander un devis de livraison'],
+    ['MISSING_TRACKING', 'Numéro de suivi manquant'],
+    ['WRONG_TRACKING', 'Numéro de suivi invalide'],
+    ['CONTACT_CARRIER_STATUS', 'Demander le statut au transporteur'],
+    ['MISSING_INVOICE', 'Facture vendeur manquante'],
+    ['SHIPPING_DELAYED', 'Livraison en retard'],
+    ['PACKAGING_PROOF', 'Demander une photo du colis préparé'],
+    ['FULFILLMENT_CONFIRM', 'Confirmer la prise en charge de la commande'],
     [
       'QUALITY_OR_DESCRIPTION_ISSUE',
-      'Damage, quality or description issue'
+      'Problème de dommage, qualité ou description'
     ]
   ],
   PENALTY: [
-    ['REJECTION_EXPLANATION', 'Explain rejection and prevention plan'],
-    ['REJECTION_STOCK_ACCURACY', 'Fix stock / catalogue accuracy'],
-    ['REJECTION_DAMAGE_QA', 'Damage — packaging / QA process'],
-    ['REJECTION_REPEATED_NOTICE', 'Repeated rejections — formal notice']
+    ['REJECTION_EXPLANATION', 'Expliquer le refus et le plan de prévention'],
+    ['REJECTION_STOCK_ACCURACY', 'Corriger le stock ou le catalogue'],
+    ['REJECTION_DAMAGE_QA', "Revoir l’emballage et le contrôle qualité"],
+    ['REJECTION_REPEATED_NOTICE', 'Refus répétés — rappel formel']
   ],
   PAYMENT: [
-    ['MISSING_IBAN', 'IBAN missing or invalid'],
-    ['STRIPE_CONNECT_ISSUE', 'Payment setup incomplete'],
-    ['PAYOUT_METHOD', 'Payout method needs update'],
-    ['BANKING_DOCS', 'Banking documents required']
+    ['MISSING_IBAN', 'IBAN manquant ou invalide'],
+    ['STRIPE_CONNECT_ISSUE', 'Configuration des paiements incomplète'],
+    ['PAYOUT_METHOD', 'Mode de versement à mettre à jour'],
+    ['BANKING_DOCS', 'Documents bancaires nécessaires']
   ],
   OTHER: []
+}
+
+const INFO_REQUEST_CATEGORY_LABELS = {
+  PRODUCT: 'Produit',
+  VENDOR: 'Vendeur',
+  ORDER: 'Commande',
+  PENALTY: 'Pénalité',
+  PAYMENT: 'Paiement',
+  OTHER: 'Autre'
 }
 
 function normalizeInfoRequest(value) {
@@ -245,14 +339,16 @@ function InfoRequestFields({ value, onChange, disabled }) {
           fontSize: '12px',
           fontWeight: 650
         },
-        children: 'Kepler Info Request details'
+        children: "Détails de l’Info Request"
       }),
       ...value.sections.map((section, sectionIndex) => {
         const options = INFO_REQUEST_OPTIONS[section.category] || []
         const context = section.contextRef
         const contextLabels =
           context?.scope === 'all'
-            ? `All ${context.type}s`
+            ? context.type === 'product'
+              ? 'Tous les produits concernés'
+              : 'Toute la commande'
             : (context?.items || []).map(item => item.label).join(', ')
         return jsxs('div', {
           style: { display: 'grid', gap: '7px' },
@@ -260,7 +356,11 @@ function InfoRequestFields({ value, onChange, disabled }) {
             jsxs('div', {
               style: rowStyle,
               children: [
-                jsx(Badge, { children: section.category }),
+                jsx(Badge, {
+                  children:
+                    INFO_REQUEST_CATEGORY_LABELS[section.category] ||
+                    'Catégorie à vérifier'
+                }),
                 contextLabels
                   ? jsx('span', {
                       style: {
@@ -311,7 +411,7 @@ function InfoRequestFields({ value, onChange, disabled }) {
                     color: 'var(--ui-text-tertiary)',
                     fontSize: '12px'
                   },
-                  children: 'Free-text request'
+                  children: 'Demande libre'
                 })
           ]
         })
@@ -347,8 +447,8 @@ function ActionCard({ ctx, actionId, streaming }) {
         loadError instanceof Error ? loadError.message.slice(0, 180) : ''
       setError(
         detail
-          ? `This action card could not be loaded: ${detail}`
-          : 'This action card could not be loaded.'
+          ? `Cette carte n’a pas pu être chargée : ${detail}`
+          : 'Cette carte n’a pas pu être chargée.'
       )
     } finally {
       setLoading(false)
@@ -399,10 +499,12 @@ function ActionCard({ ctx, actionId, streaming }) {
       setInfoRequest(
         normalizeInfoRequest(result.card.metadata?.infoRequest || null)
       )
-      host.notify({ kind: 'success', message: 'Draft saved' })
+      host.notify({ kind: 'success', message: 'Brouillon enregistré' })
       return result.card
     } catch {
-      setError('The draft changed elsewhere. Reload it before continuing.')
+      setError(
+        'Ce brouillon a été modifié ailleurs. Rechargez-le avant de continuer.'
+      )
       return null
     } finally {
       setWorking('')
@@ -432,7 +534,9 @@ function ActionCard({ ctx, actionId, streaming }) {
       setRejectReason('')
       return result.card
     } catch {
-      setError('The action could not be recorded. Reload and try again.')
+      setError(
+        "L’action n’a pas pu être enregistrée. Rechargez puis réessayez."
+      )
       return null
     } finally {
       setWorking('')
@@ -441,10 +545,10 @@ function ActionCard({ ctx, actionId, streaming }) {
 
   const reject = async () => {
     const rejected = await decide('REJECT', {
-      reason: rejectReason.trim() || 'Rejected from Hermes Desktop'
+      reason: rejectReason.trim() || 'Refusé depuis Hermes Desktop'
     })
     if (rejected) {
-      host.notify({ kind: 'success', message: 'Action rejected' })
+      host.notify({ kind: 'success', message: 'Action refusée' })
     }
   }
 
@@ -460,8 +564,8 @@ function ActionCard({ ctx, actionId, streaming }) {
       kind: 'success',
       message:
         copied.kind === 'VENDOR_SIDE_CONVERSATION'
-          ? 'Vendor request copied — create the side conversation in Intercom'
-          : 'Customer reply copied'
+          ? 'Demande vendeur copiée — créez la conversation associée dans Intercom'
+          : 'Réponse client copiée'
     })
   }
 
@@ -470,7 +574,7 @@ function ActionCard({ ctx, actionId, streaming }) {
     if (monitored) {
       host.notify({
         kind: 'success',
-        message: 'Hermes is now monitoring this conversation'
+        message: 'Hermes suit maintenant cette conversation'
       })
     }
   }
@@ -490,10 +594,10 @@ function ActionCard({ ctx, actionId, streaming }) {
         kind: 'success',
         message:
           channel === 'KEPLER_INFO_REQUEST'
-            ? `Info Request #${result.execution.threadId} sent to the vendor`
+            ? `Info Request n° ${result.execution.threadId} envoyée au vendeur`
             : channel === 'INTERCOM_VENDOR_EMAIL'
-              ? 'Vendor email sent through Intercom'
-              : 'Customer reply sent through Intercom'
+              ? 'E-mail vendeur envoyé via Intercom'
+              : 'Réponse client envoyée via Intercom'
       })
       return result.card
     } catch (executeError) {
@@ -503,8 +607,8 @@ function ActionCard({ ctx, actionId, streaming }) {
           : ''
       setError(
         detail
-          ? `The approved action was not confirmed: ${detail}`
-          : 'The approved action was not confirmed. Retry safely.'
+          ? `L’action approuvée n’a pas été confirmée : ${detail}`
+          : "L’action approuvée n’a pas été confirmée. Vous pouvez réessayer sans risque de doublon."
       )
       return null
     } finally {
@@ -525,7 +629,7 @@ function ActionCard({ ctx, actionId, streaming }) {
       await executeApproved(approved)
       return
     }
-    host.notify({ kind: 'success', message: 'Action approved' })
+    host.notify({ kind: 'success', message: 'Action approuvée' })
   }
 
   if (!UUID_RE.test(actionId)) return null
@@ -534,7 +638,7 @@ function ActionCard({ ctx, actionId, streaming }) {
       style: cardStyle,
       children: jsx('div', {
         style: { padding: '14px', color: 'var(--ui-text-tertiary)' },
-        children: 'Loading action card…'
+        children: 'Chargement de la carte…'
       })
     })
   }
@@ -546,13 +650,13 @@ function ActionCard({ ctx, actionId, streaming }) {
         children: [
           jsx('span', {
             style: { color: 'var(--ui-danger)' },
-            children: error || 'Action card unavailable.'
+            children: error || 'Carte indisponible.'
           }),
           jsx(Button, {
             size: 'sm',
             variant: 'secondary',
             onClick: load,
-            children: 'Retry'
+            children: 'Réessayer'
           })
         ]
       })
@@ -565,7 +669,7 @@ function ActionCard({ ctx, actionId, streaming }) {
 
   return jsxs('section', {
     style: cardStyle,
-    'aria-label': `${kindLabel(card)} for ${card.recipientLabel}`,
+    'aria-label': `${kindLabel(card)} pour ${card.recipientLabel}`,
     children: [
       jsxs('div', {
         style: headerStyle,
@@ -585,14 +689,14 @@ function ActionCard({ ctx, actionId, streaming }) {
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap'
                 },
-                children: `To ${card.recipientLabel} · ${card.language.toUpperCase()}`
+                children: `Destinataire : ${card.recipientLabel} · ${card.language.toUpperCase()}`
               })
             ]
           }),
           jsxs('div', {
             style: rowStyle,
             children: [
-              dirty ? jsx(Badge, { children: 'Unsaved edits' }) : null,
+              dirty ? jsx(Badge, { children: 'Modifications non enregistrées' }) : null,
               jsx(Badge, { children: statusLabel(card.status) })
             ]
           })
@@ -605,8 +709,8 @@ function ActionCard({ ctx, actionId, streaming }) {
             ? jsx(Input, {
                 value: subject,
                 disabled: !canEdit || Boolean(working),
-                placeholder: 'Subject',
-                'aria-label': 'Message subject',
+                placeholder: 'Objet',
+                'aria-label': 'Objet du message',
                 onChange: event => setSubject(event.target.value)
               })
             : null,
@@ -622,7 +726,7 @@ function ActionCard({ ctx, actionId, streaming }) {
             maxLength: infoRequest ? 4000 : 10000,
             rows: Math.min(14, Math.max(6, body.split('\n').length + 2)),
             disabled: !canEdit || Boolean(working),
-            'aria-label': 'Editable message',
+            'aria-label': 'Message modifiable',
             onChange: event => setBody(event.target.value),
             style: {
               resize: canEdit ? 'vertical' : 'none',
@@ -639,7 +743,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                       color: 'var(--ui-text-tertiary)',
                       fontSize: '12px'
                     },
-                    children: 'Why Hermes proposed this'
+                    children: 'Pourquoi Hermes propose cette action'
                   }),
                   jsx('p', {
                     style: {
@@ -672,7 +776,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                 children: [
                   jsx(Input, {
                     value: rejectReason,
-                    placeholder: 'Why are you rejecting this draft? (optional)',
+                    placeholder: 'Pourquoi refusez-vous ce brouillon ? (facultatif)',
                     onChange: event => setRejectReason(event.target.value),
                     autoFocus: true
                   }),
@@ -683,14 +787,14 @@ function ActionCard({ ctx, actionId, streaming }) {
                         size: 'sm',
                         onClick: reject,
                         disabled: Boolean(working),
-                        children: 'Confirm rejection'
+                        children: 'Confirmer le refus'
                       }),
                       jsx(Button, {
                         size: 'sm',
                         variant: 'secondary',
                         onClick: () => setRejecting(false),
                         disabled: Boolean(working),
-                        children: 'Cancel'
+                        children: 'Annuler'
                       })
                     ]
                   })
@@ -711,7 +815,10 @@ function ActionCard({ ctx, actionId, streaming }) {
                     variant: 'secondary',
                     onClick: save,
                     disabled: !dirty || Boolean(working) || !body.trim(),
-                    children: working === 'save' ? 'Saving…' : 'Save edits'
+                    children:
+                      working === 'save'
+                        ? 'Enregistrement…'
+                        : 'Enregistrer les modifications'
                   })
                 : null,
               card.status === 'DRAFT'
@@ -721,7 +828,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                     disabled: Boolean(working) || !body.trim(),
                     children:
                       working === 'APPROVE' || working === 'execute'
-                        ? 'Sending…'
+                        ? 'Envoi…'
                         : approvalLabel(card)
                   })
                 : null,
@@ -731,7 +838,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                     variant: 'secondary',
                     onClick: () => setRejecting(true),
                     disabled: Boolean(working),
-                    children: 'Reject'
+                    children: 'Refuser'
                   })
                 : null
             ]
@@ -748,8 +855,8 @@ function ActionCard({ ctx, actionId, streaming }) {
                     disabled: Boolean(working),
                     children:
                       card.kind === 'VENDOR_SIDE_CONVERSATION'
-                        ? 'Copy & open Intercom'
-                        : 'Copy approved reply'
+                        ? 'Copier et ouvrir Intercom'
+                        : 'Copier la réponse approuvée'
                   })
                 : null,
               [
@@ -764,7 +871,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                     disabled: Boolean(working),
                     children:
                       working === 'execute'
-                        ? 'Sending…'
+                        ? 'Envoi…'
                         : executionLabel(card)
                   })
                 : null,
@@ -777,8 +884,8 @@ function ActionCard({ ctx, actionId, streaming }) {
                     disabled: Boolean(working),
                     children:
                       working === 'START_MONITORING'
-                        ? 'Starting…'
-                        : 'Side conversation created'
+                        ? 'Activation…'
+                        : 'Conversation vendeur créée'
                   })
                 : null
             ]
@@ -790,24 +897,34 @@ function ActionCard({ ctx, actionId, streaming }) {
 }
 
 const CS_VIEW_OPTIONS = [
-  ['TEAM_SUPPORT', 'Support team'],
-  ['MY_INBOX', 'My inbox'],
-  ['ESCALATION_RISK', 'Escalation'],
-  ['FRUSTRATED_PRIORITY', 'Frustrated'],
-  ['ETA_REQUEST', 'ETA'],
-  ['SHIPPING_QUOTE', 'Shipping quotes']
+  ['TEAM_SUPPORT', 'Équipe Support'],
+  ['MY_INBOX', 'Ma boîte de réception'],
+  ['ESCALATION_RISK', "Risque d’escalade"],
+  ['FRUSTRATED_PRIORITY', 'Clients mécontents'],
+  ['ETA_REQUEST', 'Demandes de délai'],
+  ['SHIPPING_QUOTE', 'Devis de livraison']
 ]
+
+function priorityLabel(priority) {
+  return {
+    CRITICAL: 'Critique',
+    URGENT: 'Urgent',
+    HIGH: 'Priorité élevée',
+    MEDIUM: 'Priorité normale',
+    LOW: 'Priorité faible'
+  }[priority] || 'À évaluer'
+}
 
 function resolutionPrompt(situation) {
   if ((situation.signals || []).includes('TEST_ONLY')) {
     return [
       'Ceci est un test de notification Hermes, pas un dossier client réel.',
-      'Confirme que le bouton Resolve now a correctement ouvert ce chat dédié.',
+      'Confirme que le bouton Résoudre maintenant a correctement ouvert ce chat dédié.',
       'Ne contacte personne et ne prépare aucune action externe.'
     ].join('\n')
   }
   return [
-    `Résous maintenant cette situation CS : ${situation.id}.`,
+    'Résous maintenant cette situation du service client.',
     situation.title,
     situation.summary,
     `Action recommandée : ${situation.nextAction}.`,
@@ -823,7 +940,11 @@ function resolutionPrompt(situation) {
 
 async function openSituationChat(situation, profile) {
   const prompt = resolutionPrompt(situation)
-  const title = `CS · ${situation.id}`.slice(0, 180)
+  const title = `CS · ${
+    situation.orderNumber
+      ? `Commande #${situation.orderNumber}`
+      : situation.title || 'Dossier à résoudre'
+  }`.slice(0, 180)
   const testOnly = (situation.signals || []).includes('TEST_ONLY')
   try {
     const listed = await host.request('session.list', {
@@ -854,7 +975,9 @@ async function openSituationChat(situation, profile) {
     const runtimeId = session?.session_id
     const storedId =
       session?.stored_session_id || existing?.resolved_id || existing?.id
-    if (!runtimeId || !storedId) throw new Error('Session creation failed')
+    if (!runtimeId || !storedId) {
+      throw new Error('Le chat dédié n’a pas pu être créé')
+    }
     await host.request('prompt.submit', {
       session_id: runtimeId,
       text: prompt
@@ -868,7 +991,7 @@ async function openSituationChat(situation, profile) {
     if (ok) return true
     host.notify({
       kind: 'error',
-      message: 'Could not open the dedicated resolution chat'
+      message: 'Le chat dédié à la résolution n’a pas pu être ouvert'
     })
     return false
   }
@@ -904,7 +1027,7 @@ function OperationsOverview({
       setError(
         loadError instanceof Error
           ? loadError.message.slice(0, 220)
-          : 'CS overview unavailable'
+          : 'La vue du service client est indisponible'
       )
     } finally {
       setLoading(false)
@@ -928,7 +1051,7 @@ function OperationsOverview({
       style: cardStyle,
       children: jsx('div', {
         style: { padding: '14px', color: 'var(--ui-text-tertiary)' },
-        children: 'Building the global CS overview…'
+        children: 'Préparation de la vue priorisée du service client…'
       })
     })
   }
@@ -940,13 +1063,14 @@ function OperationsOverview({
         children: [
           jsx('span', {
             style: { color: 'var(--ui-danger)', fontSize: '12px' },
-            children: error || 'Global CS overview unavailable.'
+            children:
+              error || 'La vue globale du service client est indisponible.'
           }),
           jsx(Button, {
             size: 'sm',
             variant: 'secondary',
             onClick: load,
-            children: 'Retry'
+            children: 'Réessayer'
           })
         ]
       })
@@ -955,7 +1079,7 @@ function OperationsOverview({
 
   return jsxs('section', {
     style: { ...cardStyle, width: 'min(820px, 100%)' },
-    'aria-label': 'Global Customer Service priorities',
+    'aria-label': 'Priorités globales du service client',
     children: [
       jsxs('div', {
         style: headerStyle,
@@ -965,7 +1089,7 @@ function OperationsOverview({
             children: [
               jsx('strong', {
                 style: { fontSize: '14px' },
-                children: 'Customer Service priorities'
+                children: 'Priorités du service client'
               }),
               jsx('span', {
                 style: {
@@ -980,7 +1104,7 @@ function OperationsOverview({
             size: 'sm',
             variant: 'secondary',
             onClick: load,
-            children: 'Refresh'
+            children: 'Actualiser'
           })
         ]
       }),
@@ -1016,7 +1140,7 @@ function OperationsOverview({
                   color: 'var(--ui-text-tertiary)',
                   fontSize: '13px'
                 },
-                children: 'No actionable situation found.'
+                children: 'Aucune situation nécessitant une action.'
               })
             : overview.situations.map(situation =>
                 jsxs('article', {
@@ -1053,7 +1177,9 @@ function OperationsOverview({
                             })
                           ]
                         }),
-                        jsx(Badge, { children: situation.priority })
+                        jsx(Badge, {
+                          children: priorityLabel(situation.priority)
+                        })
                       ]
                     }),
                     jsx('span', {
@@ -1086,7 +1212,7 @@ function OperationsOverview({
                         jsx(Button, {
                           size: 'sm',
                           onClick: () => resolveNow(situation),
-                          children: 'Resolve now'
+                          children: 'Résoudre maintenant'
                         })
                       ]
                     })
@@ -1190,7 +1316,7 @@ async function pollDesktopNotifications(ctx) {
           actions: [
             {
               id: 'resolve-now',
-              label: 'Resolve now',
+              label: 'Résoudre maintenant',
               onAction: resolve
             }
           ]
@@ -1253,7 +1379,7 @@ function NotificationStatus({ ctx }) {
   return jsxs('button', {
     type: 'button',
     onClick: () => host.navigate('/oblist-notifications'),
-    'aria-label': `${count} unread Customer Service notification${count > 1 ? 's' : ''}`,
+    'aria-label': `${count} notification${count > 1 ? 's' : ''} non lue${count > 1 ? 's' : ''}`,
     style: {
       display: 'inline-flex',
       height: '100%',
@@ -1338,7 +1464,7 @@ function NotificationBanner() {
           fontWeight: 700,
           whiteSpace: 'nowrap'
         },
-        children: 'Open alerts →'
+        children: 'Ouvrir les alertes →'
       })
     ]
   })
@@ -1361,7 +1487,7 @@ function NotificationInboxPage({ ctx }) {
       setError(
         refreshError instanceof Error
           ? refreshError.message.slice(0, 180)
-          : 'Notification inbox unavailable'
+          : 'La boîte de notifications est indisponible'
       )
     } finally {
       setRefreshing(false)
@@ -1385,7 +1511,7 @@ function NotificationInboxPage({ ctx }) {
       setError(
         readError instanceof Error
           ? readError.message.slice(0, 180)
-          : 'Could not mark this notification as read'
+          : 'Cette notification n’a pas pu être marquée comme lue'
       )
     } finally {
       setWorking('')
@@ -1407,7 +1533,7 @@ function NotificationInboxPage({ ctx }) {
       setError(
         resolveError instanceof Error
           ? resolveError.message.slice(0, 180)
-          : 'Could not open this notification'
+          : 'Cette notification n’a pas pu être ouverte'
       )
     } finally {
       setWorking('')
@@ -1436,14 +1562,16 @@ function NotificationInboxPage({ ctx }) {
             children: [
               jsx('h1', {
                 style: { margin: 0, fontSize: '20px' },
-                children: 'CS Notifications'
+                children: 'Notifications du service client'
               }),
               jsx('span', {
                 style: {
                   color: 'var(--ui-text-tertiary)',
                   fontSize: '12px'
                 },
-                children: `${notifications.length} unread · ${operator || 'Gary global view'}`
+                children: `${notifications.length} non lue${
+                  notifications.length > 1 ? 's' : ''
+                } · ${operator || 'Vue globale de Gary'}`
               })
             ]
           }),
@@ -1452,7 +1580,7 @@ function NotificationInboxPage({ ctx }) {
             variant: 'secondary',
             disabled: refreshing,
             onClick: () => void refresh(),
-            children: refreshing ? 'Refreshing…' : 'Refresh'
+            children: refreshing ? 'Actualisation…' : 'Actualiser'
           })
         ]
       }),
@@ -1476,7 +1604,7 @@ function NotificationInboxPage({ ctx }) {
               color: 'var(--ui-text-tertiary)',
               textAlign: 'center'
             },
-            children: 'No unread Customer Service notification.'
+            children: 'Aucune notification non lue.'
           })
         : jsx('div', {
             style: { display: 'grid', gap: '10px' },
@@ -1508,7 +1636,7 @@ function NotificationInboxPage({ ctx }) {
                           })
                         ]
                       }),
-                      jsx(Badge, { children: priority })
+                      jsx(Badge, { children: priorityLabel(priority) })
                     ]
                   }),
                   jsxs('div', {
@@ -1556,7 +1684,7 @@ function NotificationInboxPage({ ctx }) {
                             variant: 'secondary',
                             disabled: working === notification.id,
                             onClick: () => dismiss(notification),
-                            children: 'Dismiss'
+                            children: 'Ignorer'
                           }),
                           situation?.id
                             ? jsx(Button, {
@@ -1565,8 +1693,8 @@ function NotificationInboxPage({ ctx }) {
                                 onClick: () => resolve(notification),
                                 children:
                                   working === notification.id
-                                    ? 'Opening…'
-                                    : 'Resolve now'
+                                    ? 'Ouverture…'
+                                    : 'Résoudre maintenant'
                               })
                             : null
                         ]
@@ -1585,6 +1713,16 @@ export default {
   id: 'oblist-action-cards',
   name: 'The Oblist Action Cards',
   register(ctx) {
+    const uninstallIntroMessage = installCsIntroMessage()
+    ctx.onDispose(uninstallIntroMessage)
+    ctx.register({
+      id: 'oblist-cs-quick-prompts',
+      area: COMPOSER_AREAS.microActions,
+      order: 20,
+      data: {
+        resolve: ({ busy }) => quickPromptActions(ctx, busy)
+      }
+    })
     const syncActiveProfile = () => {
       const { operator } = currentNotificationScope()
       setActiveNotificationOperator(operator)
@@ -1624,7 +1762,8 @@ export default {
           order: 45,
           data: {
             path: '/oblist-notifications',
-            label: count > 0 ? `🔴 CS Alerts (${count})` : 'CS Alerts',
+            label:
+              count > 0 ? `🔴 Alertes CS (${count})` : 'Alertes CS',
             codicon: 'bell'
           }
         })
