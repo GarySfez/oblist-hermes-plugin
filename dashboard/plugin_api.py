@@ -73,10 +73,32 @@ async def get_action(action_id: str):
 
 
 @router.get("/overview")
-async def get_overview():
+async def get_overview(request: Request):
+    operator = request.query_params.get("operator", "")
+    view = request.query_params.get("view", "")
+    if operator not in {"", "lyse", "philippine"}:
+        raise HTTPException(status_code=400, detail="Invalid operator")
+    allowed_views = {
+        "",
+        "MY_INBOX",
+        "TEAM_SUPPORT",
+        "ESCALATION_RISK",
+        "FRUSTRATED_PRIORITY",
+        "ETA_REQUEST",
+        "SHIPPING_QUOTE",
+    }
+    if view not in allowed_views:
+        raise HTTPException(status_code=400, detail="Invalid view")
+    query = urllib.parse.urlencode(
+        {
+            **({"operatorRef": operator} if operator else {}),
+            **({"viewKey": view} if view else {}),
+            "limit": "40",
+        }
+    )
     return await asyncio.to_thread(
         _request_ai_ops,
-        "/v1/cs-overview?limit=40",
+        f"/v1/cs-overview?{query}",
     )
 
 

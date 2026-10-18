@@ -771,7 +771,25 @@ function ActionCard({ ctx, actionId, streaming }) {
   })
 }
 
-function OperationsOverview({ ctx, streaming }) {
+const CS_VIEW_OPTIONS = [
+  ['TEAM_SUPPORT', 'Support team'],
+  ['MY_INBOX', 'My inbox'],
+  ['ESCALATION_RISK', 'Escalation'],
+  ['FRUSTRATED_PRIORITY', 'Frustrated'],
+  ['ETA_REQUEST', 'ETA'],
+  ['SHIPPING_QUOTE', 'Shipping quotes']
+]
+
+function OperationsOverview({
+  ctx,
+  streaming,
+  operatorRef,
+  initialView
+}) {
+  const defaultView =
+    initialView ||
+    (operatorRef ? 'MY_INBOX' : 'TEAM_SUPPORT')
+  const [activeView, setActiveView] = useState(defaultView)
   const [overview, setOverview] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -779,7 +797,13 @@ function OperationsOverview({ ctx, streaming }) {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const result = await ctx.rest('/overview', { timeoutMs: 60_000 })
+      const query = new URLSearchParams({
+        view: activeView,
+        ...(operatorRef ? { operator: operatorRef } : {})
+      }).toString()
+      const result = await ctx.rest(`/overview?${query}`, {
+        timeoutMs: 60_000
+      })
       setOverview(result)
       setError('')
     } catch (loadError) {
@@ -791,7 +815,7 @@ function OperationsOverview({ ctx, streaming }) {
     } finally {
       setLoading(false)
     }
-  }, [ctx])
+  }, [activeView, ctx, operatorRef])
 
   useEffect(() => {
     load()
@@ -871,7 +895,7 @@ function OperationsOverview({ ctx, streaming }) {
                   color: 'var(--ui-text-tertiary)',
                   fontSize: '12px'
                 },
-                children: `${overview.summary.supportOpen} open in Support · ${overview.summary.supportUnanswered} awaiting a reply`
+                children: `${overview.scope?.operatorName ? `${overview.scope.operatorName} · ` : ''}${overview.summary.supportOpen} open · ${overview.summary.supportUnanswered} awaiting a reply`
               })
             ]
           }),
@@ -882,6 +906,24 @@ function OperationsOverview({ ctx, streaming }) {
             children: 'Refresh'
           })
         ]
+      }),
+      jsx('div', {
+        style: {
+          display: 'flex',
+          gap: '6px',
+          flexWrap: 'wrap',
+          padding: '10px 14px 0'
+        },
+        children: CS_VIEW_OPTIONS.filter(
+          ([key]) => key !== 'MY_INBOX' || Boolean(operatorRef)
+        ).map(([key, label]) =>
+          jsx(Button, {
+            size: 'sm',
+            variant: activeView === key ? 'primary' : 'secondary',
+            onClick: () => setActiveView(key),
+            children: label
+          })
+        )
       }),
       jsx('div', {
         style: {
@@ -1001,7 +1043,16 @@ export default {
       area: TRANSCRIPT_DIRECTIVE_AREA,
       data: {
         name: 'oblist-ops-overview',
-        render: ({ streaming }) => jsx(OperationsOverview, { ctx, streaming })
+        render: ({ attrs, streaming }) =>
+          jsx(OperationsOverview, {
+            ctx,
+            streaming,
+            operatorRef:
+              attrs.operator === 'lyse' || attrs.operator === 'philippine'
+                ? attrs.operator
+                : '',
+            initialView: attrs.view || attrs.scope || ''
+          })
       }
     })
   }
