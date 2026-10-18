@@ -1096,7 +1096,7 @@ function OperationsOverview({
                   color: 'var(--ui-text-tertiary)',
                   fontSize: '12px'
                 },
-                children: `${overview.scope?.operatorName ? `${overview.scope.operatorName} · ` : ''}${overview.summary.supportOpen} open · ${overview.summary.supportUnanswered} awaiting a reply`
+                children: `${overview.scope?.operatorName ? `${overview.scope.operatorName} · ` : ''}${overview.summary.supportOpen} ouvertes · ${overview.summary.supportUnanswered} en attente de réponse`
               })
             ]
           }),
@@ -1182,6 +1182,17 @@ function OperationsOverview({
                         })
                       ]
                     }),
+                    ...(situation.importantInformation || []).map(
+                      information =>
+                        jsx('strong', {
+                          style: {
+                            color: 'var(--ui-text-primary)',
+                            fontSize: '11px',
+                            lineHeight: 1.4
+                          },
+                          children: information
+                        })
+                    ),
                     jsx('span', {
                       style: {
                         color: 'var(--ui-text-tertiary)',
@@ -1650,6 +1661,17 @@ function NotificationInboxPage({ ctx }) {
                         },
                         children: notification.body
                       }),
+                      ...(situation?.importantInformation || []).map(
+                        information =>
+                          jsx('strong', {
+                            style: {
+                              color: 'var(--ui-text-primary)',
+                              fontSize: '12px',
+                              lineHeight: 1.45
+                            },
+                            children: information
+                          })
+                      ),
                       situation?.summary
                         ? jsx('span', {
                             style: {
