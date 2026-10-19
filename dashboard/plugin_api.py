@@ -5,7 +5,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -514,29 +517,43 @@ def _managed_plugin_release() -> dict:
     }
 
 
-async def _install_managed_plugin(target_commit: str) -> None:
+def _hermes_cli() -> str:
+    sibling = Path(sys.executable).with_name("hermes")
+    if sibling.is_file():
+        return str(sibling)
+    executable = shutil.which("hermes")
+    if not executable:
+        raise RuntimeError("Hermes CLI is unavailable")
+    return executable
+
+
+def _install_managed_plugin(target_commit: str) -> None:
     if not _MANAGED_PLUGIN_COMMIT_RE.fullmatch(target_commit):
         raise RuntimeError("Managed plugin release commit is invalid")
-    from hermes_cli.plugins_cmd import dashboard_install_plugin
-    from hermes_cli.web_routers.dashboard_ui import (
-        _plugin_action,
-        _plugin_mutation,
-    )
-
-    result = await _plugin_mutation(
-        lambda: _plugin_action(
-            dashboard_install_plugin(
+    try:
+        result = subprocess.run(
+            [
+                _hermes_cli(),
+                "plugins",
+                "install",
                 _MANAGED_PLUGIN_REPOSITORY,
-                force=True,
-                enable=True,
-                ref=target_commit,
-                assume_deps_consent=True,
-            ),
-            "Managed plugin update failed.",
-            rescan=True,
+                "--ref",
+                target_commit,
+                "--force",
+                "--yes-deps",
+                "--enable",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd="/opt/data",
         )
-    )
-    if result.get("ok") is not True:
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Managed plugin update timed out") from error
+    except OSError as error:
+        raise RuntimeError("Managed plugin update could not start") from error
+    if result.returncode != 0:
         raise RuntimeError("Managed plugin update failed")
     if _current_managed_plugin_commit() != target_commit:
         raise RuntimeError("Managed plugin update verification failed")
@@ -568,7 +585,10 @@ async def _apply_managed_plugin_release(
             raise ManagedPluginReleaseUnavailableError(
                 "Managed plugin release is no longer available"
             )
-        await _install_managed_plugin(target_commit)
+        await asyncio.to_thread(
+            _install_managed_plugin,
+            target_commit,
+        )
     _schedule_dashboard_restart()
     return {
         "ok": True,
