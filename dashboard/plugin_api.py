@@ -51,6 +51,9 @@ _AI_OPS_API_PATHS = {
     "workflow_confirm_assignment": (
         "/v1/case-watches/{workflow_id}/claim/confirm"
     ),
+    "workflow_release": (
+        "/v1/case-watches/{workflow_id}/claim/release"
+    ),
     "workflow_closure": "/v1/case-watches/{workflow_id}/closure",
 }
 _RELEASE_CONTRACT_PATH = Path(__file__).with_name("release_contract.json")
@@ -687,6 +690,41 @@ async def claim_workflow(workflow_id: str, body: dict, request: Request):
     return await asyncio.to_thread(
         _request_ai_ops,
         _api_path("workflow_claim", workflow_id=workflow_id),
+        "POST",
+        payload,
+    )
+
+
+@router.post("/workflows/{workflow_id}/release")
+async def release_workflow_claim(
+    workflow_id: str,
+    body: dict,
+    request: Request,
+):
+    workflow_id = _validated_id(workflow_id)
+    operator = _authorized_operator(
+        request,
+        request.query_params.get("operator", ""),
+    )
+    workflow_payload = _workflow_action_payload(
+        body,
+        request,
+        operator,
+    )
+    claim_token = workflow_payload.get("claimToken")
+    if (
+        not isinstance(claim_token, str)
+        or not _UUID_RE.fullmatch(claim_token)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid reservation")
+    payload = {
+        "operatorRef": operator,
+        "claimToken": claim_token,
+    }
+    await asyncio.to_thread(_require_live_runtime)
+    return await asyncio.to_thread(
+        _request_ai_ops,
+        _api_path("workflow_release", workflow_id=workflow_id),
         "POST",
         payload,
     )

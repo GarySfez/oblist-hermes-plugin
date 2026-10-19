@@ -44,6 +44,8 @@ const API_PATHS = Object.freeze({
   workflowClaim: workflowId => `/workflows/${workflowId}/claim`,
   workflowConfirmAssignment: workflowId =>
     `/workflows/${workflowId}/confirm-assignment`,
+  workflowRelease: workflowId =>
+    `/workflows/${workflowId}/release`,
   workflowClosure: workflowId => `/workflows/${workflowId}/closure`
 })
 
@@ -1604,6 +1606,68 @@ function priorityLabel(priority) {
   }[priority] || 'À évaluer'
 }
 
+function priorityPill(priority) {
+  const tone =
+    {
+      CRITICAL: {
+        color: '#f87171',
+        background: 'rgba(239, 68, 68, 0.15)',
+        border: 'rgba(248, 113, 113, 0.35)'
+      },
+      URGENT: {
+        color: '#fb923c',
+        background: 'rgba(249, 115, 22, 0.15)',
+        border: 'rgba(251, 146, 60, 0.35)'
+      },
+      HIGH: {
+        color: '#fbbf24',
+        background: 'rgba(245, 158, 11, 0.14)',
+        border: 'rgba(251, 191, 36, 0.34)'
+      },
+      MEDIUM: {
+        color: '#60a5fa',
+        background: 'rgba(59, 130, 246, 0.14)',
+        border: 'rgba(96, 165, 250, 0.34)'
+      },
+      LOW: {
+        color: '#86efac',
+        background: 'rgba(34, 197, 94, 0.12)',
+        border: 'rgba(134, 239, 172, 0.3)'
+      }
+    }[priority] || {
+      color: 'var(--ui-text-secondary)',
+      background: 'var(--ui-bg-primary)',
+      border: 'var(--ui-stroke-secondary)'
+    }
+  return jsxs('span', {
+    style: {
+      display: 'inline-flex',
+      alignItems: 'center',
+      gap: '6px',
+      padding: '3px 8px',
+      border: `1px solid ${tone.border}`,
+      borderRadius: '999px',
+      background: tone.background,
+      color: tone.color,
+      fontSize: '11px',
+      fontWeight: 700,
+      whiteSpace: 'nowrap'
+    },
+    children: [
+      jsx('span', {
+        'aria-hidden': true,
+        style: {
+          width: '6px',
+          height: '6px',
+          borderRadius: '999px',
+          background: 'currentColor'
+        }
+      }),
+      priorityLabel(priority)
+    ]
+  })
+}
+
 const WORKFLOW_PHASE_LABELS = {
   NEW: 'Nouveau dossier',
   INVESTIGATING: 'Analyse en cours',
@@ -2273,12 +2337,22 @@ function notificationSection(label, content, options = {}) {
   return jsxs('div', {
     style: {
       display: 'grid',
-      gap: '5px',
+      gap: '4px',
       padding:
-        options.prominent === true ? '12px 0' : '8px 0',
-      borderBottom: options.last
+        options.prominent === true
+          ? '8px 10px'
+          : options.panel
+            ? '7px 9px'
+            : '6px 0',
+      borderBottom: options.last || options.panel
         ? 'none'
-        : '1px solid var(--ui-stroke-secondary)'
+        : '1px solid var(--ui-stroke-secondary)',
+      borderRadius: options.panel ? '8px' : 0,
+      background: options.accent
+        ? 'rgba(59, 130, 246, 0.1)'
+        : options.panel
+          ? 'var(--ui-bg-primary)'
+          : 'transparent'
     },
     children: [
       jsx('span', {
@@ -2297,9 +2371,9 @@ function notificationSection(label, content, options = {}) {
             color: options.prominent
               ? 'var(--ui-text-primary)'
               : 'var(--ui-text-secondary)',
-            fontSize: options.prominent ? '15px' : '12px',
+            fontSize: options.prominent ? '14px' : '12px',
             fontWeight: options.prominent ? 700 : 500,
-            lineHeight: 1.5
+            lineHeight: 1.4
           },
           children: value,
           key: `${label}-${index}`
@@ -2761,12 +2835,77 @@ async function claimNotificationWatch(ctx, notification) {
     }
   )
   await refreshNotificationInbox(ctx, operator)
-  host.notify({
-    kind: 'info',
-    message:
-      'Dossier réservé pendant 30 minutes. Confirmez l’attribution dans vos alertes avant de contacter le client.'
-  })
   return result
+}
+
+async function resolveNotificationNow(
+  ctx,
+  notification,
+  profile = currentNotificationScope().profile
+) {
+  const situation = notification?.payload?.situation
+  const watchId = notification?.payload?.watchId
+  if (!situation?.id || !UUID_RE.test(watchId || '')) {
+    throw new Error('INVALID_NOTIFICATION_CASE')
+  }
+  const { operator } = currentNotificationScope()
+  const claimed = await claimNotificationWatch(ctx, notification)
+  const claim = claimed?.claim
+  if (
+    !claim ||
+    !UUID_RE.test(claim.claimToken || '') ||
+    !Number.isInteger(claim.workflowCycle)
+  ) {
+    throw new Error('CASE_WATCH_CLAIM_MISSING')
+  }
+  try {
+    await ctx.rest(
+      `${API_PATHS.workflowConfirmAssignment(watchId)}${operatorQuery(
+        operator
+      )}`,
+      {
+        method: 'POST',
+        body: {
+          expectedVersion: claim.workflowCycle,
+          reservationRef: claim.claimToken
+        },
+        timeoutMs: 30_000
+      }
+    )
+  } catch (error) {
+    await ctx
+      .rest(
+        `${API_PATHS.workflowRelease(watchId)}${operatorQuery(
+          operator
+        )}`,
+        {
+          method: 'POST',
+          body: { reservationRef: claim.claimToken },
+          timeoutMs: 20_000
+        }
+      )
+      .catch(() => undefined)
+    throw error
+  }
+  await readNotification(ctx, notification.id)
+  await openSituationChat(
+    situation,
+    operator || profile || undefined,
+    {
+      presentation: notification?.payload?.presentation,
+      requestedBy: notification?.payload?.requestedBy,
+      manualRequest:
+        notification?.payload?.manualRequest === true,
+      workflow: normalizeWorkflow(notification),
+      notificationCreatedAt: notification.createdAt,
+      changeSummary: notification?.payload?.changeSummary
+    }
+  )
+  host.notify({
+    kind: 'success',
+    message: 'Dossier pris en charge et session de résolution ouverte'
+  })
+  return true
 }
 
 async function pollDesktopNotifications(ctx) {
@@ -2805,9 +2944,11 @@ async function pollDesktopNotifications(ctx) {
       const closure = closureNotificationPayload(notification)
       try {
         const resolve = async () => {
-          await claimNotificationWatch(ctx, notification)
-          host.navigate('/oblist-notifications')
-          return true
+          return resolveNotificationNow(
+            ctx,
+            notification,
+            profile
+          )
         }
         host.notify({
           kind: 'info',
@@ -3098,7 +3239,11 @@ function NotificationInboxPage({ ctx }) {
     setWorking(notification.id)
     setError('')
     try {
-      await claimNotificationWatch(ctx, notification)
+      await resolveNotificationNow(
+        ctx,
+        notification,
+        profile
+      )
       await refresh()
     } catch (resolveError) {
       setError(
@@ -3227,7 +3372,9 @@ function NotificationInboxPage({ ctx }) {
                   borderRadius: '8px',
                   background: 'var(--ui-bg-primary)',
                   color: 'var(--ui-text-primary)',
-                  padding: '0 8px'
+                  padding: '0 7px',
+                  width: '160px',
+                  fontSize: '12px'
                 },
                 children: [
                   jsx('option', {
@@ -3254,7 +3401,9 @@ function NotificationInboxPage({ ctx }) {
                   borderRadius: '8px',
                   background: 'var(--ui-bg-primary)',
                   color: 'var(--ui-text-primary)',
-                  padding: '0 8px'
+                  padding: '0 7px',
+                  width: '165px',
+                  fontSize: '12px'
                 },
                 children: [
                   jsx('option', {
@@ -3289,7 +3438,9 @@ function NotificationInboxPage({ ctx }) {
                   borderRadius: '8px',
                   background: 'var(--ui-bg-primary)',
                   color: 'var(--ui-text-primary)',
-                  padding: '0 8px'
+                  padding: '0 7px',
+                  width: '135px',
+                  fontSize: '12px'
                 },
                 children: [
                   jsx('option', {
@@ -3411,44 +3562,76 @@ function NotificationInboxPage({ ctx }) {
                           })
                         ]
                       }),
-                      jsx(Badge, { children: priorityLabel(priority) })
+                      priorityPill(priority)
                     ]
                   }),
                   jsxs('div', {
                     style: {
                       ...bodyStyle,
-                      gap: 0
+                      gap: '7px',
+                      padding: '10px 12px'
                     },
                     children: [
                       notificationSection(
                         'Dossier',
                         presentation.dossier,
-                        { prominent: true }
+                        { prominent: true, panel: true }
                       ),
-                      notificationSection(
-                        'Source',
-                        presentation.source
-                      ),
-                      notificationSection(
-                        'Mission',
-                        presentation.mission
-                      ),
+                      jsxs('div', {
+                        style: {
+                          display: 'grid',
+                          gridTemplateColumns:
+                            'repeat(auto-fit, minmax(220px, 1fr))',
+                          gap: '7px'
+                        },
+                        children: [
+                          notificationSection(
+                            'Source',
+                            presentation.source,
+                            { panel: true }
+                          ),
+                          notificationSection(
+                            'Mission',
+                            presentation.mission,
+                            { panel: true }
+                          )
+                        ]
+                      }),
                       notificationSection(
                         'Résumé',
-                        presentation.summary
+                        presentation.summary,
+                        { panel: true }
                       ),
-                      notificationSection(
-                        'État actuel',
-                        presentation.currentState
-                      ),
-                      notificationSection(
-                        'À vérifier',
-                        presentation.checks.map(item => `• ${item}`)
-                      ),
+                      jsxs('div', {
+                        style: {
+                          display: 'grid',
+                          gridTemplateColumns:
+                            'repeat(auto-fit, minmax(220px, 1fr))',
+                          gap: '7px'
+                        },
+                        children: [
+                          notificationSection(
+                            'État actuel',
+                            presentation.currentState,
+                            { panel: true }
+                          ),
+                          notificationSection(
+                            'À vérifier',
+                            presentation.checks.map(
+                              item => `• ${item}`
+                            ),
+                            { panel: true }
+                          )
+                        ]
+                      }),
                       notificationSection(
                         'Prochaine action',
                         presentation.nextAction,
-                        { last: true }
+                        {
+                          last: true,
+                          panel: true,
+                          accent: true
+                        }
                       ),
                       jsx(WorkflowPanel, {
                         ctx,
