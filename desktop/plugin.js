@@ -24,11 +24,14 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+const GIT_COMMIT_RE = /^[a-f0-9]{40}$/
 
 const PLUGIN_VERSION = '0.4.0'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const API_PATHS = Object.freeze({
   runtime: '/runtime',
+  pluginRelease: '/plugin-release',
+  pluginReleaseApply: '/plugin-release/apply',
   action: actionId => `/actions/${actionId}`,
   actionEdit: actionId => `/actions/${actionId}/edit`,
   actionDecision: actionId => `/actions/${actionId}/decision`,
@@ -63,9 +66,11 @@ const operationsOverviewCache = new Map()
 const operationsOverviewRequests = new Map()
 const runtimeHandshakeCache = new Map()
 const runtimeHandshakeRequests = new Map()
+const managedPluginReleaseRequests = new Map()
 const ACTION_CARD_CACHE_MS = 60_000
 const OPERATIONS_OVERVIEW_CACHE_MS = 90_000
 const RUNTIME_HANDSHAKE_CACHE_MS = 15_000
+const MANAGED_PLUGIN_RELEASE_POLL_MS = 60_000
 const notificationInboxAtom = atom({
   activeOperator: '',
   byOperator: {
@@ -79,6 +84,14 @@ const runtimeCompatibilityAtom = atom({
   connectionKey: '',
   runtime: V1_RUNTIME
 })
+const managedPluginReleaseAtom = atom({
+  state: 'idle',
+  connectionKey: '',
+  release: null,
+  checkedAt: 0,
+  error: ''
+})
+let lastManagedReleaseNotice = ''
 
 function currentConnectionKey() {
   return String(
@@ -186,6 +199,112 @@ function useRuntimeCompatibility(ctx) {
     void refreshRuntimeHandshake(ctx)
   }, [ctx])
   return compatibility.runtime
+}
+
+function normalizeManagedPluginRelease(value) {
+  if (
+    !value ||
+    value.channelVersion !== 1 ||
+    value.repository !== 'GarySfez/oblist-hermes-plugin'
+  ) {
+    return null
+  }
+  const targetCommit =
+    typeof value.targetCommit === 'string' &&
+    GIT_COMMIT_RE.test(value.targetCommit)
+      ? value.targetCommit
+      : null
+  return {
+    policy: ['OFF', 'NOTIFY', 'AUTO'].includes(value.policy)
+      ? value.policy
+      : 'OFF',
+    releaseLabel:
+      typeof value.releaseLabel === 'string'
+        ? value.releaseLabel.slice(0, 100)
+        : 'Mise à jour The Oblist',
+    targetCommit,
+    currentCommit:
+      typeof value.currentCommit === 'string' &&
+      GIT_COMMIT_RE.test(value.currentCommit)
+        ? value.currentCommit
+        : null,
+    available: value.available === true,
+    updateAvailable:
+      value.updateAvailable === true && targetCommit !== null,
+    applyAllowed:
+      value.applyAllowed === true && targetCommit !== null,
+    automatic: value.automatic === true
+  }
+}
+
+async function refreshManagedPluginRelease(ctx, force = false) {
+  const connectionKey = currentConnectionKey()
+  const current = managedPluginReleaseAtom.get()
+  if (
+    !force &&
+    current.connectionKey === connectionKey &&
+    current.checkedAt > 0 &&
+    Date.now() - current.checkedAt < MANAGED_PLUGIN_RELEASE_POLL_MS
+  ) {
+    return current.release
+  }
+
+  let request = managedPluginReleaseRequests.get(connectionKey)
+  if (!request) {
+    request = ctx
+      .rest(API_PATHS.pluginRelease, { timeoutMs: 20_000 })
+      .then(normalizeManagedPluginRelease)
+      .finally(() => managedPluginReleaseRequests.delete(connectionKey))
+    managedPluginReleaseRequests.set(connectionKey, request)
+  }
+  managedPluginReleaseAtom.set({
+    ...current,
+    state: 'loading',
+    connectionKey,
+    error: ''
+  })
+  try {
+    const release = await request
+    managedPluginReleaseAtom.set({
+      state: 'ready',
+      connectionKey,
+      release,
+      checkedAt: Date.now(),
+      error: ''
+    })
+    if (
+      release?.updateAvailable &&
+      release.targetCommit !== lastManagedReleaseNotice
+    ) {
+      lastManagedReleaseNotice = release.targetCommit
+      host.notify({
+        kind: 'info',
+        message:
+          `${release.releaseLabel} est disponible dans Accueil CS.`
+      })
+    }
+    return release
+  } catch (error) {
+    managedPluginReleaseAtom.set({
+      state: 'error',
+      connectionKey,
+      release: current.release,
+      checkedAt: Date.now(),
+      error: readableUiError(
+        error,
+        'La vérification des mises à jour est indisponible.',
+      )
+    })
+    return current.release
+  }
+}
+
+function useManagedPluginRelease(ctx) {
+  const state = useValue(managedPluginReleaseAtom)
+  useEffect(() => {
+    void refreshManagedPluginRelease(ctx)
+  }, [ctx])
+  return state
 }
 
 const QUICK_PROMPT_USAGE_KEY = 'cs-quick-prompt-usage-v1'
@@ -323,6 +442,159 @@ const footerStyle = {
   borderTop: '1px solid var(--ui-stroke-secondary)'
 }
 
+function ManagedPluginUpdateStatus({ ctx }) {
+  const managed = useManagedPluginRelease(ctx)
+  const [installing, setInstalling] = useState(false)
+  const [error, setError] = useState('')
+  const release = managed.release
+
+  if (managed.state === 'restarting') {
+    return jsxs('div', {
+      role: 'status',
+      style: {
+        display: 'grid',
+        gap: '6px',
+        padding: '12px 14px',
+        border: '1px solid rgba(96, 165, 250, 0.38)',
+        borderRadius: '10px',
+        background: 'rgba(59, 130, 246, 0.1)',
+        color: 'var(--ui-text-primary)',
+        textAlign: 'left'
+      },
+      children: [
+        jsx('strong', {
+          children: 'Mise à jour installée'
+        }),
+        jsx('span', {
+          style: {
+            color: 'var(--ui-text-secondary)',
+            fontSize: '12px',
+            lineHeight: 1.45
+          },
+          children:
+            'Hermes recharge l’interface The Oblist. La reconnexion est automatique.'
+        })
+      ]
+    })
+  }
+
+  if (!release?.updateAvailable) return null
+
+  const install = async () => {
+    if (!release.applyAllowed || !release.targetCommit) return
+    setInstalling(true)
+    setError('')
+    try {
+      await ctx.rest(API_PATHS.pluginReleaseApply, {
+        method: 'POST',
+        body: { expectedCommit: release.targetCommit },
+        timeoutMs: 330_000
+      })
+      managedPluginReleaseAtom.set({
+        ...managedPluginReleaseAtom.get(),
+        state: 'restarting',
+        error: ''
+      })
+      host.notify({
+        kind: 'success',
+        message:
+          'Mise à jour installée. Hermes se reconnecte automatiquement.'
+      })
+    } catch (installError) {
+      setError(
+        readableUiError(
+          installError,
+          'La mise à jour n’a pas pu être installée. La version actuelle reste active.',
+        )
+      )
+      setInstalling(false)
+    }
+  }
+
+  return jsxs('div', {
+    role: 'alert',
+    style: {
+      display: 'grid',
+      gap: '10px',
+      padding: '13px 14px',
+      border: '1px solid rgba(251, 191, 36, 0.38)',
+      borderRadius: '10px',
+      background: 'rgba(245, 158, 11, 0.1)',
+      color: 'var(--ui-text-primary)',
+      textAlign: 'left'
+    },
+    children: [
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: '9px'
+        },
+        children: [
+          jsx(Codicon, {
+            name: 'cloud-download',
+            size: '1rem'
+          }),
+          jsxs('div', {
+            style: { display: 'grid', gap: '3px' },
+            children: [
+              jsx('strong', {
+                children: release.releaseLabel
+              }),
+              jsx('span', {
+                style: {
+                  color: 'var(--ui-text-secondary)',
+                  fontSize: '12px',
+                  lineHeight: 1.45
+                },
+                children:
+                  'Une version approuvée de l’interface The Oblist est disponible. Vos conversations et brouillons sont conservés.'
+              })
+            ]
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '10px',
+          flexWrap: 'wrap'
+        },
+        children: [
+          error
+            ? jsx('span', {
+                role: 'alert',
+                style: {
+                  color: 'var(--ui-danger)',
+                  fontSize: '12px'
+                },
+                children: error
+              })
+            : jsx('span', {
+                style: {
+                  color: 'var(--ui-text-tertiary)',
+                  fontSize: '11px'
+                },
+                children:
+                  'L’installation et la reconnexion sont automatiques.'
+              }),
+          jsx(Button, {
+            size: 'sm',
+            disabled:
+              installing || release.applyAllowed !== true,
+            onClick: () => void install(),
+            children: installing
+              ? 'Installation…'
+              : 'Mettre à jour'
+          })
+        ]
+      })
+    ]
+  })
+}
+
 function RuntimeCompatibilityStatus({ ctx }) {
   const runtime = useRuntimeCompatibility(ctx)
   if (runtimeBlocksV2(runtime)) {
@@ -436,6 +708,7 @@ function CsHomePage({ ctx }) {
           children:
             'Vous pouvez me demander de retrouver une commande, analyser une conversation, vérifier une livraison ou un dédouanement, faire le point sur un retour, un remboursement ou un client VIP/VIC, puis préparer les prochaines actions sans rien envoyer sans votre accord.'
         }),
+        jsx(ManagedPluginUpdateStatus, { ctx }),
         jsx(RuntimeCompatibilityStatus, { ctx }),
         jsx('div', {
           style: {
@@ -3801,6 +4074,14 @@ export default {
       RUNTIME_HANDSHAKE_CACHE_MS
     )
     ctx.onDispose(() => window.clearInterval(runtimeTimer))
+    void refreshManagedPluginRelease(ctx, true)
+    const managedReleaseTimer = window.setInterval(
+      () => void refreshManagedPluginRelease(ctx, true),
+      MANAGED_PLUGIN_RELEASE_POLL_MS
+    )
+    ctx.onDispose(() =>
+      window.clearInterval(managedReleaseTimer)
+    )
     syncActiveProfile()
     const notificationTimer = window.setInterval(
       () => void pollDesktopNotifications(ctx),

@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -31,8 +33,14 @@ _PREFLIGHT_CACHE: dict[
 ] = {}
 _PLUGIN_VERSION = "0.4.0"
 _RELEASE_EPOCH = "hermes-intelligence-v2"
+_MANAGED_PLUGIN_REPOSITORY = "GarySfez/oblist-hermes-plugin"
+_MANAGED_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_MANAGED_PLUGIN_COMMIT_RE = re.compile(r"^[a-f0-9]{40}$")
+_MANAGED_PLUGIN_UPDATE_LOCK = asyncio.Lock()
+_MANAGED_PLUGIN_WATCH_TASK: asyncio.Task | None = None
 _AI_OPS_API_PATHS = {
     "runtime_handshake": "/v1/release/handshake",
+    "plugin_release": "/v1/plugin-release",
     "action": "/v1/action-cards/{action_id}",
     "action_edit": "/v1/action-cards/{action_id}/edit",
     "action_decision": "/v1/action-cards/{action_id}/decision",
@@ -57,6 +65,10 @@ _AI_OPS_API_PATHS = {
     "workflow_closure": "/v1/case-watches/{workflow_id}/closure",
 }
 _RELEASE_CONTRACT_PATH = Path(__file__).with_name("release_contract.json")
+
+
+class ManagedPluginReleaseUnavailableError(RuntimeError):
+    pass
 
 
 def _api_path(name: str, **values: str) -> str:
@@ -442,6 +454,174 @@ def _require_live_runtime() -> dict:
     return runtime
 
 
+def _current_managed_plugin_commit() -> str | None:
+    try:
+        head = (
+            _MANAGED_PLUGIN_ROOT / ".git" / "HEAD"
+        ).read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return None
+    if _MANAGED_PLUGIN_COMMIT_RE.fullmatch(head):
+        return head
+    if not head.startswith("ref: "):
+        return None
+    ref = head[5:].strip()
+    if not ref or ".." in ref or ref.startswith("/"):
+        return None
+    try:
+        commit = (
+            _MANAGED_PLUGIN_ROOT / ".git" / ref
+        ).read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return None
+    return commit if _MANAGED_PLUGIN_COMMIT_RE.fullmatch(commit) else None
+
+
+def _managed_plugin_release() -> dict:
+    current_commit = _current_managed_plugin_commit()
+    query = urllib.parse.urlencode(
+        {"currentCommit": current_commit}
+        if current_commit
+        else {}
+    )
+    path = _api_path("plugin_release")
+    payload = _request_ai_ops(f"{path}?{query}" if query else path)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("channelVersion") != 1
+        or payload.get("repository") != _MANAGED_PLUGIN_REPOSITORY
+        or payload.get("policy") not in {"OFF", "NOTIFY", "AUTO"}
+    ):
+        raise RuntimeError("Managed plugin release is invalid")
+    target_commit = payload.get("targetCommit")
+    if target_commit is not None and (
+        not isinstance(target_commit, str)
+        or not _MANAGED_PLUGIN_COMMIT_RE.fullmatch(target_commit)
+    ):
+        raise RuntimeError("Managed plugin release commit is invalid")
+    return {
+        **payload,
+        "currentCommit": current_commit,
+        "updateAvailable": (
+            target_commit is not None
+            and current_commit != target_commit
+        ),
+        "applyAllowed": (
+            payload.get("available") is True
+            and target_commit is not None
+            and current_commit != target_commit
+        ),
+    }
+
+
+async def _install_managed_plugin(target_commit: str) -> None:
+    if not _MANAGED_PLUGIN_COMMIT_RE.fullmatch(target_commit):
+        raise RuntimeError("Managed plugin release commit is invalid")
+    from hermes_cli.plugins_cmd import dashboard_install_plugin
+    from hermes_cli.web_routers.dashboard_ui import (
+        _plugin_action,
+        _plugin_mutation,
+    )
+
+    result = await _plugin_mutation(
+        lambda: _plugin_action(
+            dashboard_install_plugin(
+                _MANAGED_PLUGIN_REPOSITORY,
+                force=True,
+                enable=True,
+                ref=target_commit,
+                assume_deps_consent=True,
+            ),
+            "Managed plugin update failed.",
+            rescan=True,
+        )
+    )
+    if result.get("ok") is not True:
+        raise RuntimeError("Managed plugin update failed")
+    if _current_managed_plugin_commit() != target_commit:
+        raise RuntimeError("Managed plugin update verification failed")
+
+
+def _schedule_dashboard_restart() -> None:
+    def restart() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    timer = threading.Timer(1.5, restart)
+    timer.daemon = True
+    timer.start()
+
+
+async def _apply_managed_plugin_release(
+    expected_commit: str | None = None,
+) -> dict:
+    async with _MANAGED_PLUGIN_UPDATE_LOCK:
+        release = await asyncio.to_thread(_managed_plugin_release)
+        target_commit = release.get("targetCommit")
+        if (
+            release.get("applyAllowed") is not True
+            or not isinstance(target_commit, str)
+            or (
+                expected_commit is not None
+                and target_commit != expected_commit
+            )
+        ):
+            raise ManagedPluginReleaseUnavailableError(
+                "Managed plugin release is no longer available"
+            )
+        await _install_managed_plugin(target_commit)
+    _schedule_dashboard_restart()
+    return {
+        "ok": True,
+        "installedCommit": target_commit,
+        "releaseLabel": release.get("releaseLabel"),
+        "restarting": True,
+    }
+
+
+async def _managed_plugin_watch_loop() -> None:
+    await asyncio.sleep(15)
+    while True:
+        try:
+            release = await asyncio.to_thread(_managed_plugin_release)
+            if (
+                release.get("automatic") is True
+                and release.get("applyAllowed") is True
+            ):
+                await _apply_managed_plugin_release()
+                return
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(300)
+
+
+@router.on_event("startup")
+async def start_managed_plugin_watcher() -> None:
+    global _MANAGED_PLUGIN_WATCH_TASK
+    if (
+        _MANAGED_PLUGIN_WATCH_TASK is None
+        or _MANAGED_PLUGIN_WATCH_TASK.done()
+    ):
+        _MANAGED_PLUGIN_WATCH_TASK = asyncio.create_task(
+            _managed_plugin_watch_loop(),
+            name="oblist-managed-plugin-release",
+        )
+
+
+@router.on_event("shutdown")
+async def stop_managed_plugin_watcher() -> None:
+    global _MANAGED_PLUGIN_WATCH_TASK
+    if _MANAGED_PLUGIN_WATCH_TASK is not None:
+        task = _MANAGED_PLUGIN_WATCH_TASK
+        task.cancel()
+        _MANAGED_PLUGIN_WATCH_TASK = None
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 def _workflow_action_payload(
     body: dict,
     request: Request,
@@ -496,6 +676,60 @@ async def get_runtime(request: Request):
         **runtime,
         "checkedAt": int(time.time() * 1000),
     }
+
+
+@router.get("/plugin-release")
+async def get_plugin_release(request: Request):
+    _require_oblist_operator(request)
+    try:
+        return await asyncio.to_thread(_managed_plugin_release)
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail="La vérification des mises à jour est indisponible.",
+        ) from error
+
+
+@router.post("/plugin-release/apply")
+async def apply_plugin_release(body: dict, request: Request):
+    _require_oblist_operator(request)
+    expected_commit = body.get("expectedCommit")
+    if (
+        not isinstance(expected_commit, str)
+        or not _MANAGED_PLUGIN_COMMIT_RE.fullmatch(expected_commit)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid plugin release")
+    if _MANAGED_PLUGIN_UPDATE_LOCK.locked():
+        raise HTTPException(
+            status_code=409,
+            detail="Une mise à jour est déjà en cours.",
+        )
+    try:
+        return await _apply_managed_plugin_release(expected_commit)
+    except ManagedPluginReleaseUnavailableError as error:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cette mise à jour n’est plus disponible. "
+                "Actualisez Accueil CS."
+            ),
+        ) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "La mise à jour n’a pas pu être installée. "
+                "La version actuelle reste active."
+            ),
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "La mise à jour n’a pas pu être installée. "
+                "La version actuelle reste active."
+            ),
+        ) from error
 
 
 @router.get("/actions/{action_id}")
