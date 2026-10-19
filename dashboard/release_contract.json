@@ -1,0 +1,10 @@
+{
+  "releaseVersion": "hermes-intelligence-v2",
+  "contractVersion": "2.0.0",
+  "schemaVersion": "009_durable_workflow_controlled_learning",
+  "memoryApiVersion": "0.1.0",
+  "workerVersion": "0.1.0",
+  "pluginVersion": "0.4.0",
+  "manifestDigestEnv": "OBLIST_HERMES_MANIFEST_DIGEST",
+  "manifestDigest": null
+}
