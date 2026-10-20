@@ -17,8 +17,8 @@ The Oblist release channel. Only the exact commit approved by AI Ops can be
 installed. A `NOTIFY` release appears in **Accueil CS** with one
 **Mettre à jour** button; an `AUTO` release is installed by the Agent process.
 The official Hermes installer performs the replacement, verifies the checked
-out commit, then the supervised dashboard process restarts and Desktop
-reconnects automatically.
+out commit, then Hermes hot-reloads the Agent and Desktop surfaces without
+ending the remote browser session.
 
 The release channel can target Global, Lyse and Philippine independently.
 Setting the channel to `OFF` or removing its approved commit fails closed.

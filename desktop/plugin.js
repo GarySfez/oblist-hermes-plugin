@@ -448,7 +448,7 @@ function ManagedPluginUpdateStatus({ ctx }) {
   const [error, setError] = useState('')
   const release = managed.release
 
-  if (managed.state === 'restarting') {
+  if (managed.state === 'updated') {
     return jsxs('div', {
       role: 'status',
       style: {
@@ -472,7 +472,7 @@ function ManagedPluginUpdateStatus({ ctx }) {
             lineHeight: 1.45
           },
           children:
-            'Hermes recharge l’interface The Oblist. La reconnexion est automatique.'
+            'L’interface The Oblist a été rechargée à chaud. Vous pouvez continuer sans vous reconnecter.'
         })
       ]
     })
@@ -492,13 +492,13 @@ function ManagedPluginUpdateStatus({ ctx }) {
       })
       managedPluginReleaseAtom.set({
         ...managedPluginReleaseAtom.get(),
-        state: 'restarting',
+        state: 'updated',
         error: ''
       })
       host.notify({
         kind: 'success',
         message:
-          'Mise à jour installée. Hermes se reconnecte automatiquement.'
+          'Mise à jour installée sans interrompre votre session.'
       })
     } catch (installError) {
       setError(
@@ -578,7 +578,7 @@ function ManagedPluginUpdateStatus({ ctx }) {
                   fontSize: '11px'
                 },
                 children:
-                  'L’installation et la reconnexion sont automatiques.'
+                  'L’installation et le rechargement sont automatiques.'
               }),
           jsx(Button, {
             size: 'sm',

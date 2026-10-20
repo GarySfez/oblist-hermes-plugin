@@ -6,10 +6,8 @@ import os
 from pathlib import Path
 import re
 import shutil
-import signal
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -559,15 +557,6 @@ def _install_managed_plugin(target_commit: str) -> None:
         raise RuntimeError("Managed plugin update verification failed")
 
 
-def _schedule_dashboard_restart() -> None:
-    def restart() -> None:
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    timer = threading.Timer(1.5, restart)
-    timer.daemon = True
-    timer.start()
-
-
 async def _apply_managed_plugin_release(
     expected_commit: str | None = None,
 ) -> dict:
@@ -589,12 +578,12 @@ async def _apply_managed_plugin_release(
             _install_managed_plugin,
             target_commit,
         )
-    _schedule_dashboard_restart()
     return {
         "ok": True,
         "installedCommit": target_commit,
         "releaseLabel": release.get("releaseLabel"),
-        "restarting": True,
+        "reloaded": True,
+        "restarting": False,
     }
 
 
