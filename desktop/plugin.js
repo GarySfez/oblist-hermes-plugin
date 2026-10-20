@@ -1153,6 +1153,13 @@ function InfoRequestFields({ value, onChange, disabled }) {
   })
 }
 
+function actionCardMatchesDirective(card, actionId) {
+  return (
+    UUID_RE.test(actionId || '') &&
+    card?.id === actionId
+  )
+}
+
 function ActionCard({ ctx, actionId, streaming }) {
   const runtime = useRuntimeCompatibility(ctx)
   const actionCacheKey = `${currentConnectionKey()}:${currentProfileKey()}:${actionId}`
@@ -1175,6 +1182,7 @@ function ActionCard({ ctx, actionId, streaming }) {
   const [outcomeRecorded, setOutcomeRecorded] = useState('')
 
   const applyCard = useCallback((nextCard, cachedAt = Date.now()) => {
+    if (!actionCardMatchesDirective(nextCard, actionId)) return
     actionCardCache.set(actionCacheKey, {
       card: nextCard,
       cachedAt
@@ -1186,7 +1194,7 @@ function ActionCard({ ctx, actionId, streaming }) {
       normalizeInfoRequest(nextCard.metadata?.infoRequest || null)
     )
     setEditReason('')
-  }, [actionCacheKey])
+  }, [actionCacheKey, actionId])
 
   const load = useCallback(async (force = false) => {
     if (!UUID_RE.test(actionId)) return
@@ -1263,7 +1271,13 @@ function ActionCard({ ctx, actionId, streaming }) {
   )
 
   const save = async () => {
-    if (!card || !dirty || !body.trim()) return card
+    if (
+      !actionCardMatchesDirective(card, actionId) ||
+      !dirty ||
+      !body.trim()
+    ) {
+      return card
+    }
     if (materialChange && !editReason.trim()) {
       setError('Indiquez brièvement pourquoi cette modification est importante.')
       return null
@@ -1295,7 +1309,7 @@ function ActionCard({ ctx, actionId, streaming }) {
   }
 
   const decide = async (decision, options = {}) => {
-    if (!card) return null
+    if (!actionCardMatchesDirective(card, actionId)) return null
     let current = card
     if (dirty) {
       current = await save()
@@ -1376,7 +1390,12 @@ function ActionCard({ ctx, actionId, streaming }) {
   }
 
   const executeApproved = async approvedCard => {
-    if (!approvedCard || approvedCard.status !== 'APPROVED') return
+    if (
+      !actionCardMatchesDirective(approvedCard, actionId) ||
+      approvedCard.status !== 'APPROVED'
+    ) {
+      return
+    }
     if (!criticAllowsAction(approvedCard, runtime)) {
       setError(
         'Cette action reste bloquée tant que la vérification du brouillon n’est pas terminée.'
@@ -1497,7 +1516,11 @@ function ActionCard({ ctx, actionId, streaming }) {
   }
 
   if (!UUID_RE.test(actionId)) return null
-  if (streaming || loading) {
+  if (
+    streaming ||
+    loading ||
+    (card && !actionCardMatchesDirective(card, actionId))
+  ) {
     return jsx('div', {
       style: cardStyle,
       children: jsx('div', {
