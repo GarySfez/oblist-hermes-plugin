@@ -74,7 +74,7 @@ const visionAttachmentLinkCache = new Map()
 const visionAttachmentLinkRequests = new Map()
 
 const PLUGIN_VERSION = '0.5.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.20.6'
+const PLUGIN_RELEASE_REVISION = '2026.10.20.7'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
   'https://garysfez.github.io/oblist-hermes-plugin/?update=1&desktop=1'
@@ -5219,6 +5219,14 @@ function VisionDirective({
     payload: null
   })
   const [retryVersion, setRetryVersion] = useState(0)
+  const [, setLinkRevision] = useState(0)
+  const currentState =
+    requestState.key === directiveKey
+      ? requestState
+      : { state: 'loading', payload: null }
+  const effectivePayload = directive
+    ? directPayload || currentState.payload
+    : null
 
   useEffect(() => {
     if (!directive) return undefined
@@ -5288,12 +5296,50 @@ function VisionDirective({
     streaming
   ])
 
+  useEffect(() => {
+    if (!effectivePayload || streaming) return undefined
+    const missingImageRefs = (
+      effectivePayload.attachmentBundle?.attachments || []
+    )
+      .filter(
+        item =>
+          item.descriptor.mediaKind === 'IMAGE' &&
+          item.freshLinkActions.includes('OPEN_ATTACHMENT') &&
+          !visionFreshLinkUrl(
+            effectivePayload.attachmentLinks.get(
+              item.descriptor.attachmentRef
+            ),
+            'OPEN_ATTACHMENT'
+          )
+      )
+      .map(item => item.descriptor.attachmentRef)
+      .slice(0, VISION_PRODUCT_LIMIT)
+    if (missingImageRefs.length === 0) return undefined
+
+    const controller = new AbortController()
+    let mounted = true
+    void requestVisionAttachmentLinks(
+      ctx,
+      effectivePayload,
+      missingImageRefs,
+      {
+        action: 'OPEN_ATTACHMENT',
+        signal: controller.signal
+      }
+    )
+      .then(() => {
+        if (mounted) setLinkRevision(value => value + 1)
+      })
+      .catch(() => {
+        // The attachment row and authenticated open action remain available.
+      })
+    return () => {
+      mounted = false
+      controller.abort()
+    }
+  }, [ctx, directiveKey, effectivePayload, streaming])
+
   if (!directive) return null
-  const currentState =
-    requestState.key === directiveKey
-      ? requestState
-      : { state: 'loading', payload: null }
-  const effectivePayload = directPayload || currentState.payload
   if (effectivePayload) {
     return jsx(VisionContextBlock, {
       ctx,
