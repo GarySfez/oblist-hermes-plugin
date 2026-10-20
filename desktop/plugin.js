@@ -74,7 +74,7 @@ const visionAttachmentLinkCache = new Map()
 const visionAttachmentLinkRequests = new Map()
 
 const PLUGIN_VERSION = '0.5.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.20.8'
+const PLUGIN_RELEASE_REVISION = '2026.10.20.9'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
   'https://garysfez.github.io/oblist-hermes-plugin/?update=1&desktop=1'
@@ -3243,17 +3243,35 @@ function parseVisionUiPayload(value, expectations = {}) {
 
 function parseVisionDirectiveAttrs(value) {
   if (!isVisionRecord(value)) return null
+  const allowedKeys = new Set([
+    'payloadRef',
+    'caseRef',
+    'payloadref',
+    'caseref'
+  ])
+  const conflictingAliases =
+    (
+      Object.prototype.hasOwnProperty.call(value, 'payloadRef') &&
+      Object.prototype.hasOwnProperty.call(value, 'payloadref') &&
+      value.payloadRef !== value.payloadref
+    ) ||
+    (
+      Object.prototype.hasOwnProperty.call(value, 'caseRef') &&
+      Object.prototype.hasOwnProperty.call(value, 'caseref') &&
+      value.caseRef !== value.caseref
+    )
   if (
     Object.prototype.hasOwnProperty.call(value, 'payload') ||
     Object.prototype.hasOwnProperty.call(value, 'data') ||
-    Object.keys(value).some(
-      key => !['payloadRef', 'caseRef'].includes(key)
-    )
+    conflictingAliases ||
+    Object.keys(value).some(key => !allowedKeys.has(key))
   ) {
     return null
   }
-  const payloadRef = visionRef(value.payloadRef)
-  const caseRef = visionRef(value.caseRef)
+  // Hermes normalizes directive attribute names to lowercase before invoking
+  // plugin renderers. Keep camelCase aliases for older hosts and direct tests.
+  const payloadRef = visionRef(value.payloadref ?? value.payloadRef)
+  const caseRef = visionRef(value.caseref ?? value.caseRef)
   return payloadRef && caseRef ? { payloadRef, caseRef } : null
 }
 
