@@ -516,6 +516,34 @@ def _managed_plugin_root(home: Path) -> Path:
     return home / "plugins" / _MANAGED_PLUGIN_NAME
 
 
+def _managed_git_config_path() -> Path:
+    configured_home = Path(
+        os.environ.get(
+            "HERMES_HOME",
+            str(_MANAGED_PLUGIN_ROOT.parent.parent),
+        )
+    ).expanduser().resolve()
+    return configured_home / ".oblist-managed-gitconfig"
+
+
+def _ensure_managed_git_safe_directories(homes: tuple[Path, ...]) -> Path:
+    config_path = _managed_git_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_directories = [
+        str(_managed_plugin_root(home).resolve())
+        for home in homes
+    ]
+    payload = "[safe]\n" + "".join(
+        f"\tdirectory = {directory}\n"
+        for directory in safe_directories
+    )
+    temporary = config_path.with_suffix(".tmp")
+    temporary.write_text(payload, encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(config_path)
+    return config_path
+
+
 def _managed_plugin_commit_at(plugin_root: Path) -> str | None:
     try:
         head = (
@@ -633,9 +661,7 @@ def _run_managed_plugin_install(home: Path, target_commit: str) -> None:
             env={
                 **os.environ,
                 "HERMES_HOME": str(home),
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "safe.directory",
-                "GIT_CONFIG_VALUE_0": str(_managed_plugin_root(home)),
+                "GIT_CONFIG_GLOBAL": str(_managed_git_config_path()),
             },
         )
     except subprocess.TimeoutExpired as error:
@@ -657,6 +683,7 @@ def _install_managed_plugin(target_commit: str) -> list[str]:
     homes = _managed_plugin_homes()
     if not homes:
         raise RuntimeError("Managed plugin installation is unavailable")
+    _ensure_managed_git_safe_directories(homes)
     installed_commits = _managed_plugin_commits()
     if (
         len(installed_commits) == len(homes)
