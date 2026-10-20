@@ -31,7 +31,7 @@ const VISION_DIRECTIVE_NAME = 'oblist-vision'
 const VISION_PAYLOAD_ORIGIN = 'AUTHENTICATED_API'
 const VISION_PARSED_PAYLOAD = Symbol('oblist-vision-parsed-payload')
 const VISION_PRODUCT_LIMIT = 6
-const VISION_ATTACHMENT_VISIBLE_LIMIT = 8
+const VISION_ATTACHMENT_VISIBLE_LIMIT = 12
 const VISION_HIDE_STORAGE_PREFIX = 'oblist-vision-products-hidden:v1'
 const VISION_PAYLOAD_CACHE_MS = 30_000
 const VISION_PAYLOAD_CACHE_LIMIT = 64
@@ -74,7 +74,7 @@ const visionAttachmentLinkCache = new Map()
 const visionAttachmentLinkRequests = new Map()
 
 const PLUGIN_VERSION = '0.5.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.21.11'
+const PLUGIN_RELEASE_REVISION = '2026.10.21.12'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
   'https://garysfez.github.io/oblist-hermes-plugin/?update=1&desktop=1'
@@ -2016,6 +2016,21 @@ const CS_VIEW_OPTIONS = [
   ['ETA_REQUEST', 'Demandes de délai'],
   ['SHIPPING_QUOTE', 'Devis de livraison']
 ]
+const CS_OVERVIEW_FOCUSES = new Set([
+  'ALL',
+  'PRIORITY_CUSTOMERS',
+  'VENDOR_FOLLOW_UP',
+  'CUSTOMS',
+  'DELIVERY_RISK',
+  'RETURNS'
+])
+
+function normalizeCsOverviewFocus(value) {
+  const normalized = String(value || 'ALL').trim().toUpperCase()
+  return CS_OVERVIEW_FOCUSES.has(normalized)
+    ? normalized
+    : 'ALL'
+}
 
 function priorityLabel(priority) {
   return {
@@ -3838,7 +3853,8 @@ function VisionImage({
   alt,
   width = 640,
   height = 480,
-  square = false
+  square = false,
+  fit = 'cover'
 }) {
   const [failed, setFailed] = useState(false)
   const ratio = square ? '1 / 1' : `${width} / ${height}`
@@ -3868,7 +3884,7 @@ function VisionImage({
               width: '100%',
               height: '100%',
               display: 'block',
-              objectFit: 'cover'
+              objectFit: fit
             }
           })
         : jsxs('span', {
@@ -3891,7 +3907,12 @@ function VisionImage({
   })
 }
 
-function HorizontalVisionCarousel({ label, slides, renderSlide }) {
+function HorizontalVisionCarousel({
+  label,
+  slides,
+  renderSlide,
+  cardWidth = 'clamp(148px, 29%, 206px)'
+}) {
   const reducedMotion = usePrefersReducedMotion()
   const scrollerRef = useRef(null)
   const [bounds, setBounds] = useState({
@@ -4070,7 +4091,7 @@ function HorizontalVisionCarousel({ label, slides, renderSlide }) {
         style: {
           display: 'grid',
           gridAutoFlow: 'column',
-          gridAutoColumns: 'clamp(148px, 29%, 206px)',
+          gridAutoColumns: cardWidth,
           gap: '9px',
           minWidth: 0,
           overflowX: 'auto',
@@ -4117,11 +4138,11 @@ function visionAuthorLabel(author) {
 
 function visionStatusLabel(status) {
   if (VISION_PENDING_STATUSES.has(status)) return 'Analyse en cours'
-  if (status === 'READY') return 'Analysé · DERIVED'
-  if (status === 'LINK_ONLY') return 'LINK_ONLY · non analysé'
+  if (status === 'READY') return 'Analyse disponible'
+  if (status === 'LINK_ONLY') return 'Fichier disponible'
   if (status === 'UNSUPPORTED') return 'Format non analysé'
   if (status === 'TIMED_OUT') return 'Analyse expirée'
-  if (status === 'DLQ') return 'Analyse à reprendre'
+  if (status === 'DLQ') return 'Analyse indisponible'
   if (status === 'FAILED') return 'Analyse impossible'
   return 'Statut indisponible'
 }
@@ -4165,8 +4186,8 @@ function buildVisionEvidenceSlides(payload) {
   const evidenceMode =
     payload.conformityComparisons.length > 0 ||
     attachments.some(item =>
-      ['DAMAGE_EVIDENCE', 'PRODUCT_CONFORMITY'].includes(
-        item.insight?.purpose
+      ['IMAGE', 'VIDEO'].includes(
+        item.descriptor.mediaKind
       )
     )
   if (!evidenceMode) return []
@@ -4220,7 +4241,7 @@ function buildVisionEvidenceSlides(payload) {
     })
   })
 
-  const receivedSlides = attachments.flatMap(item => {
+  const receivedSlides = attachments.flatMap((item, index) => {
     if (
       !['IMAGE', 'VIDEO'].includes(item.descriptor.mediaKind)
     ) {
@@ -4250,7 +4271,10 @@ function buildVisionEvidenceSlides(payload) {
         item.descriptor.mediaKind === 'VIDEO'
           ? 'Vidéo reçue'
           : 'Photo reçue',
-      title: item.descriptor.fileName,
+      title:
+        item.descriptor.mediaKind === 'VIDEO'
+          ? `Vidéo du retour ${index + 1}`
+          : `Photo du retour ${index + 1}`,
       meta: `${visionSourceLabel(
         item.descriptor.source
       )} · ${visionAuthorLabel(
@@ -4273,11 +4297,14 @@ function buildVisionEvidenceSlides(payload) {
     }]
   })
 
-  const expectedLimit = Math.min(3, expectedSlides.length)
+  const expectedLimit = Math.min(
+    receivedSlides.length > 0 ? 1 : 3,
+    expectedSlides.length
+  )
   return [
     ...expectedSlides.slice(0, expectedLimit),
-    ...receivedSlides.slice(0, VISION_PRODUCT_LIMIT - expectedLimit)
-  ].slice(0, VISION_PRODUCT_LIMIT)
+    ...receivedSlides.slice(0, VISION_ATTACHMENT_VISIBLE_LIMIT)
+  ]
 }
 
 function VisionProductSlide({ ctx, card }) {
@@ -4480,7 +4507,8 @@ function VisionEvidenceSlide({ ctx, payload, slide }) {
         alt: slide.imageAlt,
         width: slide.width,
         height: slide.height,
-        square: slide.kind === 'EXPECTED'
+        square: slide.kind === 'EXPECTED',
+        fit: slide.kind === 'EXPECTED' ? 'cover' : 'contain'
       }),
       jsx('strong', {
         style: {
@@ -4633,7 +4661,7 @@ function VisionAttachmentsBlock({ ctx, payload }) {
                   fontSize: '10px',
                   fontWeight: 750
                 },
-                children: 'SYNTHÈSE DERIVED'
+                children: 'Synthèse automatique'
               }),
               jsx('span', {
                 style: {
@@ -4646,7 +4674,7 @@ function VisionAttachmentsBlock({ ctx, payload }) {
             ]
           })
         : null,
-      ...visible.map(item => {
+      ...visible.map((item, index) => {
         const descriptor = item.descriptor
         const internal = descriptor.visibility === 'INTERNAL'
         return jsxs('article', {
@@ -4678,7 +4706,12 @@ function VisionAttachmentsBlock({ ctx, payload }) {
                         textOverflow: 'ellipsis',
                         whiteSpace: 'nowrap'
                       },
-                      children: descriptor.fileName
+                      children:
+                        descriptor.mediaKind === 'VIDEO'
+                          ? `Vidéo ${index + 1}`
+                          : descriptor.mediaKind === 'IMAGE'
+                            ? `Photo ${index + 1}`
+                            : `Document ${index + 1}`
                     }),
                     jsx('span', {
                       style: {
@@ -5005,10 +5038,15 @@ function VisionContextBlock({
     !visibility.duplicate
   const showProducts = canRenderProducts && !visibility.hidden
   const allEvidenceSlides = buildVisionEvidenceSlides(payload)
-  const evidenceSlides = showProducts
-    ? allEvidenceSlides
-    : allEvidenceSlides.filter(slide => slide.kind !== 'EXPECTED')
-  const showEvidence = evidenceSlides.length > 0
+  const receivedEvidenceSlides = allEvidenceSlides.filter(
+    slide => slide.kind !== 'EXPECTED'
+  )
+  const expectedEvidenceSlides = showProducts
+    ? allEvidenceSlides.filter(slide => slide.kind === 'EXPECTED')
+    : []
+  const hasVisualEvidence = receivedEvidenceSlides.length > 0
+  const attachmentCount =
+    payload.attachmentBundle?.counts.total || 0
 
   return jsxs('section', {
     'aria-label': 'Contexte visuel vérifié du dossier',
@@ -5016,11 +5054,11 @@ function VisionContextBlock({
       width: 'min(760px, 100%)',
       minWidth: 0,
       display: 'grid',
-      gap: '9px',
-      padding: '10px',
+      gap: '12px',
+      padding: '12px',
       border: '1px solid var(--ui-stroke-secondary)',
-      borderRadius: '11px',
-      background: 'var(--ui-bg-secondary)',
+      borderRadius: '12px',
+      background: 'var(--ui-bg-primary)',
       color: 'var(--ui-text-primary)',
       overflow: 'hidden'
     },
@@ -5044,8 +5082,11 @@ function VisionContextBlock({
             children: [
               jsx(Codicon, { name: 'eye', size: '0.85rem' }),
               jsx('strong', {
-                style: { fontSize: '12px' },
-                children: 'Contexte visuel'
+                style: { fontSize: '13px' },
+                children:
+                  attachmentCount > 0
+                    ? 'Preuves visuelles du retour'
+                    : 'Contexte visuel'
               })
             ]
           }),
@@ -5068,10 +5109,25 @@ function VisionContextBlock({
             children: products[0].displayReason
           })
         : null,
-      showEvidence
+      hasVisualEvidence
         ? jsx(HorizontalVisionCarousel, {
-            label: 'Produit attendu et preuves reçues',
-            slides: evidenceSlides,
+            label: 'Photos et vidéos du retour',
+            slides: receivedEvidenceSlides,
+            cardWidth: 'clamp(220px, 48%, 340px)',
+            renderSlide: slide =>
+              jsx(VisionEvidenceSlide, {
+                ctx,
+                payload,
+                slide,
+                key: slide.id
+              })
+          })
+        : null,
+      expectedEvidenceSlides.length > 0
+        ? jsx(HorizontalVisionCarousel, {
+            label: 'Produit de référence',
+            slides: expectedEvidenceSlides,
+            cardWidth: 'clamp(148px, 24%, 190px)',
             renderSlide: slide =>
               jsx(VisionEvidenceSlide, {
                 ctx,
@@ -5084,6 +5140,7 @@ function VisionContextBlock({
           ? jsx(HorizontalVisionCarousel, {
               label: 'Produits du dossier',
               slides: products.slice(0, VISION_PRODUCT_LIMIT),
+              cardWidth: 'clamp(148px, 24%, 190px)',
               renderSlide: card =>
                 jsx(VisionProductSlide, {
                   ctx,
@@ -5339,7 +5396,7 @@ function VisionDirective({
           )
       )
       .map(item => item.descriptor.attachmentRef)
-      .slice(0, VISION_PRODUCT_LIMIT)
+      .slice(0, VISION_ATTACHMENT_VISIBLE_LIMIT)
     if (missingImageRefs.length === 0) return undefined
 
     const controller = new AbortController()
@@ -5417,12 +5474,35 @@ function VisionDirective({
         size: 'sm',
         variant: 'secondary',
         onClick: () => {
+          if (currentState.state === 'expired') {
+            const sessionId =
+              host.state.focusedSessionId.get() ||
+              host.state.activeSessionId?.get?.()
+            if (!sessionId) {
+              host.notify({
+                kind: 'error',
+                message:
+                  'La demande visuelle doit être relancée depuis une conversation active.'
+              })
+              return
+            }
+            void host.composer
+              .setDraft(
+                sessionId,
+                `Recharge le contexte visuel de ${directive.caseRef}. Utilise l’outil approprié et affiche de nouveau le visuel vérifié.`
+              )
+              .then(() => host.composer.focus(sessionId))
+            return
+          }
           visionPayloadCache.delete(
             visionPayloadCacheKey(directive)
           )
           setRetryVersion(value => value + 1)
         },
-        children: 'Réessayer'
+        children:
+          currentState.state === 'expired'
+            ? 'Relancer la demande'
+            : 'Réessayer'
       })
     ]
   })
@@ -5993,7 +6073,8 @@ function OperationsOverview({
   ctx,
   streaming,
   operatorRef,
-  initialView
+  initialView,
+  focus
 }) {
   const runtime = useRuntimeCompatibility(ctx)
   const defaultView =
@@ -6002,7 +6083,7 @@ function OperationsOverview({
   const [activeView, setActiveView] = useState(defaultView)
   const cacheKey = `${currentConnectionKey()}:${currentProfileKey()}:${
     operatorRef || 'global'
-  }:${activeView}`
+  }:${activeView}:${focus || 'ALL'}`
   const initialCache = operationsOverviewCache.get(cacheKey)
   const [overview, setOverview] = useState(
     initialCache?.overview || null
@@ -6030,6 +6111,8 @@ function OperationsOverview({
     try {
       const query = new URLSearchParams({
         view: activeView,
+        focus: focus || 'ALL',
+        ...(force ? { refresh: '1' } : {}),
         ...(operatorRef ? { operator: operatorRef } : {})
       }).toString()
       let request = operationsOverviewRequests.get(cacheKey)
@@ -6059,7 +6142,7 @@ function OperationsOverview({
       setLoading(false)
       setRefreshing(false)
     }
-  }, [activeView, cacheKey, ctx, operatorRef])
+  }, [activeView, cacheKey, ctx, focus, operatorRef])
 
   useEffect(() => {
     void load()
@@ -6123,7 +6206,20 @@ function OperationsOverview({
                   color: 'var(--ui-text-tertiary)',
                   fontSize: '12px'
                 },
-                children: `${overview.scope?.operatorName ? `${overview.scope.operatorName} · ` : ''}${overview.summary.supportOpen} ouvertes · ${overview.summary.supportUnanswered} en attente de réponse`
+                children:
+                  focus && focus !== 'ALL'
+                    ? `${
+                        {
+                          PRIORITY_CUSTOMERS: 'Clients VIP et VIC',
+                          VENDOR_FOLLOW_UP: 'Suivis vendeurs',
+                          CUSTOMS: 'Dédouanements',
+                          DELIVERY_RISK: 'Risques de retard',
+                          RETURNS: 'Retours'
+                        }[focus] || 'Vue filtrée'
+                      } · ${overview.situations.length} dossier${
+                        overview.situations.length === 1 ? '' : 's'
+                      }`
+                    : `${overview.scope?.operatorName ? `${overview.scope.operatorName} · ` : ''}${overview.summary.supportOpen} ouvertes · ${overview.summary.supportUnanswered} en attente de réponse`
               })
             ]
           }),
@@ -7522,7 +7618,8 @@ export default {
               attrs.operator === 'lyse' || attrs.operator === 'philippine'
                 ? attrs.operator
                 : '',
-            initialView: attrs.view || attrs.scope || ''
+            initialView: attrs.view || attrs.scope || '',
+            focus: normalizeCsOverviewFocus(attrs.focus)
           })
       }
     })

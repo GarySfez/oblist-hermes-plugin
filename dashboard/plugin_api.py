@@ -688,6 +688,14 @@ def _hermes_cli() -> str:
 
 
 def _run_managed_plugin_install(home: Path, target_commit: str) -> None:
+    plugin_root = _managed_plugin_root(home)
+    try:
+        existing_owner = (
+            plugin_root.stat().st_uid,
+            plugin_root.stat().st_gid,
+        )
+    except OSError:
+        existing_owner = None
     try:
         result = subprocess.run(
             [
@@ -716,6 +724,17 @@ def _run_managed_plugin_install(home: Path, target_commit: str) -> None:
         raise RuntimeError("Managed plugin update timed out") from error
     except OSError as error:
         raise RuntimeError("Managed plugin update could not start") from error
+    if existing_owner is not None and hasattr(os, "lchown"):
+        owned_paths = [
+            plugin_root,
+            *plugin_root.rglob("*"),
+            home / "plugins" / ".install-metadata.json",
+        ]
+        for owned_path in owned_paths:
+            try:
+                os.lchown(owned_path, *existing_owner)
+            except OSError:
+                continue
     if result.returncode != 0:
         raise RuntimeError("Managed plugin update failed")
     if (
@@ -1195,10 +1214,26 @@ async def get_overview(request: Request):
     }
     if view not in allowed_views:
         raise HTTPException(status_code=400, detail="Invalid view")
+    focus = request.query_params.get("focus", "ALL")
+    allowed_focus = {
+        "ALL",
+        "PRIORITY_CUSTOMERS",
+        "VENDOR_FOLLOW_UP",
+        "CUSTOMS",
+        "DELIVERY_RISK",
+        "RETURNS",
+    }
+    if focus not in allowed_focus:
+        raise HTTPException(status_code=400, detail="Invalid focus")
+    refresh = request.query_params.get("refresh", "")
+    if refresh not in {"", "1"}:
+        raise HTTPException(status_code=400, detail="Invalid refresh")
     query = urllib.parse.urlencode(
         {
             **({"operatorRef": operator} if operator else {}),
             **({"viewKey": view} if view else {}),
+            "focus": focus,
+            **({"refresh": "1"} if refresh == "1" else {}),
             "limit": "40",
         }
     )
