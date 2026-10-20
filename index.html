@@ -107,9 +107,14 @@
     </main>
     <script>
       const install = document.getElementById("install");
+      const query = new URLSearchParams(window.location.search);
+      if (install && query.get("desktop") === "1") {
+        install.href =
+          "hermes://plugin-desktop/install?repo=GarySfez/oblist-hermes-plugin&enable=1&force=1";
+      }
       if (
         install &&
-        new URLSearchParams(window.location.search).get("update") === "1"
+        query.get("update") === "1"
       ) {
         window.location.replace(install.href);
       }

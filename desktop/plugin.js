@@ -28,10 +28,10 @@ const GIT_COMMIT_RE = /^[a-f0-9]{40}$/
 const PLUGIN_REVISION_RE = /^[A-Za-z0-9._-]{1,64}$/
 
 const PLUGIN_VERSION = '0.4.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.20.3'
+const PLUGIN_RELEASE_REVISION = '2026.10.20.4'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
-  'https://garysfez.github.io/oblist-hermes-plugin/?update=1'
+  'https://garysfez.github.io/oblist-hermes-plugin/?update=1&desktop=1'
 const API_PATHS = Object.freeze({
   runtime: '/runtime',
   pluginRelease: '/plugin-release',
@@ -505,14 +505,6 @@ function ManagedPluginUpdateStatus({ ctx }) {
     setInstalling(true)
     setError('')
     try {
-      await ctx.rest(API_PATHS.pluginReleaseApply, {
-        method: 'POST',
-        body: {
-          expectedCommit: release.targetCommit,
-          currentRevision: PLUGIN_RELEASE_REVISION
-        },
-        timeoutMs: 600_000
-      })
       const opened = await ctx.os.openExternal(
         MANAGED_PLUGIN_INSTALLER_URL
       )
@@ -529,6 +521,16 @@ function ManagedPluginUpdateStatus({ ctx }) {
         message:
           'Confirmez maintenant l’installation dans Hermes.'
       })
+      void ctx
+        .rest(API_PATHS.pluginReleaseApply, {
+          method: 'POST',
+          body: {
+            expectedCommit: release.targetCommit,
+            currentRevision: PLUGIN_RELEASE_REVISION
+          },
+          timeoutMs: 600_000
+        })
+        .catch(() => undefined)
     } catch (installError) {
       setError(
         readableUiError(
