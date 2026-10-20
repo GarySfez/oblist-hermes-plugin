@@ -31,6 +31,7 @@ _VISION_PAYLOAD_REF_RE = re.compile(
 _VISION_STABLE_REF_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,499}$"
 )
+_VISION_HOST_PROFILES = {"default", "global", "lyse", "philippine"}
 _VISION_ATTACHMENT_REF_LIMIT = 12
 _ADMIN_EMAILS = {"garysfez@oblist.com"}
 _OPERATOR_BY_EMAIL = {
@@ -925,13 +926,28 @@ def _validated_vision_ref(
 
 def _validated_vision_query(request: Request) -> str:
     query = request.query_params
-    if set(query.keys()) != {"caseRef"}:
+    keys = set(query.keys())
+    if (
+        "caseRef" not in keys
+        or not keys.issubset({"caseRef", "profile"})
+    ):
         raise HTTPException(
             status_code=400,
             detail="Invalid vision payload query",
         )
     getlist = getattr(query, "getlist", None)
-    if callable(getlist) and len(getlist("caseRef")) != 1:
+    if callable(getlist) and any(
+        len(getlist(key)) != 1 for key in keys
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid vision payload query",
+        )
+    profile = query.get("profile")
+    if (
+        profile is not None
+        and profile not in _VISION_HOST_PROFILES
+    ):
         raise HTTPException(
             status_code=400,
             detail="Invalid vision payload query",
