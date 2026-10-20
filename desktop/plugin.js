@@ -28,7 +28,7 @@ const GIT_COMMIT_RE = /^[a-f0-9]{40}$/
 const PLUGIN_REVISION_RE = /^[A-Za-z0-9._-]{1,64}$/
 
 const PLUGIN_VERSION = '0.4.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.20.1'
+const PLUGIN_RELEASE_REVISION = '2026.10.20.2'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
   'https://garysfez.github.io/oblist-hermes-plugin/?update=1'
@@ -2563,13 +2563,29 @@ function resolutionPrompt(situation, launchContext = {}) {
     .join('\n')
 }
 
+function resolutionSessionKey(situation, profile) {
+  const scope = String(profile || 'global').trim().toLowerCase()
+  const dossier = situation?.conversationRef
+    ? `intercom:${situation.conversationRef}`
+    : String(situation?.id || '').trim()
+  if (!dossier) {
+    throw new Error('Le dossier ne possède pas d’identifiant stable')
+  }
+  return `cs-resolution:v2:${scope}:${dossier}`.slice(0, 240)
+}
+
 async function openSituationChat(
   situation,
   profile,
   launchContext = {}
 ) {
   const prompt = resolutionPrompt(situation, launchContext)
+  const conversationLabel = situation.conversationRef
+    ? `Intercom ${situation.conversationRef} · `
+    : ''
   const title = `CS · ${
+    conversationLabel
+  }${
     situation.orderNumber
       ? `#${situation.orderNumber} · ${
           situation.title || 'Dossier à résoudre'
@@ -2578,34 +2594,19 @@ async function openSituationChat(
   }`.slice(0, 180)
   const testOnly = (situation.signals || []).includes('TEST_ONLY')
   try {
-    const listed = await host.request('session.list', {
+    const session = await host.request('session.create', {
       title,
+      idempotency_key: resolutionSessionKey(situation, profile),
+      follow_profile_config: true,
+      model: testOnly
+        ? 'anthropic/claude-haiku-5.5'
+        : 'anthropic/claude-sonnet-5.5',
+      provider: 'nous',
+      reasoning_effort: testOnly ? 'low' : 'medium',
       ...(profile ? { profile } : {})
     })
-    const existing = listed?.sessions?.[0]
-    let session
-    if (existing) {
-      session = await host.request('session.resume', {
-        session_id: existing.resolved_id || existing.id,
-        defer_history: true,
-        ...(profile ? { profile } : {})
-      })
-    } else {
-      session = await host.request('session.create', {
-        title,
-        idempotency_key: `cs-situation:${situation.id}`,
-        follow_profile_config: true,
-        model: testOnly
-          ? 'anthropic/claude-haiku-5.5'
-          : 'anthropic/claude-sonnet-5.5',
-        provider: 'nous',
-        reasoning_effort: testOnly ? 'low' : 'medium',
-        ...(profile ? { profile } : {})
-      })
-    }
     const runtimeId = session?.session_id
-    const storedId =
-      session?.stored_session_id || existing?.resolved_id || existing?.id
+    const storedId = session?.stored_session_id
     if (!runtimeId || !storedId) {
       throw new Error('Le chat dédié n’a pas pu être créé')
     }
@@ -2616,13 +2617,10 @@ async function openSituationChat(
     host.navigate(`/${encodeURIComponent(storedId)}`)
     return true
   } catch {
-    const sessionId = host.state.focusedSessionId.get()
-    const ok = await host.composer.setDraft(sessionId, prompt)
-    host.composer.focus(sessionId)
-    if (ok) return true
     host.notify({
       kind: 'error',
-      message: 'Le chat dédié à la résolution n’a pas pu être ouvert'
+      message:
+        'Le chat dédié n’a pas pu être ouvert. Aucune autre session n’a été modifiée.'
     })
     return false
   }
@@ -3211,8 +3209,7 @@ async function resolveNotificationNow(
       .catch(() => undefined)
     throw error
   }
-  await readNotification(ctx, notification.id)
-  await openSituationChat(
+  const opened = await openSituationChat(
     situation,
     operator || profile || undefined,
     {
@@ -3225,6 +3222,10 @@ async function resolveNotificationNow(
       changeSummary: notification?.payload?.changeSummary
     }
   )
+  if (!opened) {
+    throw new Error('RESOLUTION_SESSION_OPEN_FAILED')
+  }
+  await readNotification(ctx, notification.id)
   host.notify({
     kind: 'success',
     message: 'Dossier pris en charge et session de résolution ouverte'
@@ -3966,11 +3967,7 @@ function NotificationInboxPage({ ctx }) {
                           void refresh()
                           if (result?.assignment) {
                             void (async () => {
-                              await readNotification(
-                                ctx,
-                                notification.id
-                              )
-                              await openSituationChat(
+                              const opened = await openSituationChat(
                                 situation,
                                 operator || profile || undefined,
                                 {
@@ -3982,6 +3979,11 @@ function NotificationInboxPage({ ctx }) {
                                     notification?.payload?.manualRequest === true,
                                   workflow: notificationWorkflow
                                 }
+                              )
+                              if (!opened) return
+                              await readNotification(
+                                ctx,
+                                notification.id
                               )
                               await refresh()
                             })()
