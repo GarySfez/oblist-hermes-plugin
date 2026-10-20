@@ -633,6 +633,9 @@ def _run_managed_plugin_install(home: Path, target_commit: str) -> None:
             env={
                 **os.environ,
                 "HERMES_HOME": str(home),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": str(_managed_plugin_root(home)),
             },
         )
     except subprocess.TimeoutExpired as error:
