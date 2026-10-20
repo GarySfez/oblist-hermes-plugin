@@ -643,6 +643,15 @@ def _install_managed_plugin(target_commit: str) -> list[str]:
     homes = _managed_plugin_homes()
     if not homes:
         raise RuntimeError("Managed plugin installation is unavailable")
+    installed_commits = _managed_plugin_commits()
+    if (
+        len(installed_commits) == len(homes)
+        and all(
+            commit == target_commit
+            for commit in installed_commits.values()
+        )
+    ):
+        return list(installed_commits)
     previous_commits = {
         home: _managed_plugin_commit_at(_managed_plugin_root(home))
         for home in homes
