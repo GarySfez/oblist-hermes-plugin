@@ -28,7 +28,7 @@ const GIT_COMMIT_RE = /^[a-f0-9]{40}$/
 const PLUGIN_REVISION_RE = /^[A-Za-z0-9._-]{1,64}$/
 
 const PLUGIN_VERSION = '0.4.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.20.2'
+const PLUGIN_RELEASE_REVISION = '2026.10.20.3'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
   'https://garysfez.github.io/oblist-hermes-plugin/?update=1'
@@ -939,6 +939,9 @@ function kindLabel(card) {
   if (card?.metadata?.channel === 'INTERCOM_VENDOR_EMAIL') {
     return 'E-mail au vendeur via Intercom'
   }
+  if (card?.metadata?.channel === 'INTERCOM_CUSTOMER_EMAIL') {
+    return 'Nouvel e-mail au client via Intercom'
+  }
   return card?.kind === 'CUSTOMER_REPLY'
     ? 'Réponse au client'
     : 'Demande au vendeur'
@@ -947,6 +950,7 @@ function kindLabel(card) {
 function approvalLabel(card) {
   return {
     INTERCOM_CUSTOMER_REPLY: 'Approuver et envoyer dans Intercom',
+    INTERCOM_CUSTOMER_EMAIL: "Approuver et créer l’e-mail client",
     INTERCOM_VENDOR_EMAIL: "Approuver et envoyer l’e-mail",
     KEPLER_INFO_REQUEST: "Approuver et créer l’Info Request",
     INTERCOM_SIDE_CONVERSATION: 'Approuver le brouillon vendeur'
@@ -956,6 +960,7 @@ function approvalLabel(card) {
 function executionLabel(card) {
   return {
     INTERCOM_CUSTOMER_REPLY: 'Envoyer la réponse dans Intercom',
+    INTERCOM_CUSTOMER_EMAIL: "Créer et envoyer l’e-mail au client",
     INTERCOM_VENDOR_EMAIL: "Envoyer l’e-mail au vendeur",
     KEPLER_INFO_REQUEST: "Créer et envoyer l’Info Request"
   }[card?.metadata?.channel] || "Exécuter l’action approuvée"
@@ -1451,7 +1456,9 @@ function ActionCard({ ctx, actionId, streaming }) {
             ? `Info Request n° ${result.execution.threadId} envoyée au vendeur`
             : channel === 'INTERCOM_VENDOR_EMAIL'
               ? 'E-mail vendeur envoyé via Intercom'
-              : 'Réponse client envoyée via Intercom'
+              : channel === 'INTERCOM_CUSTOMER_EMAIL'
+                ? 'Nouvelle conversation client créée dans Intercom'
+                : 'Réponse client envoyée via Intercom'
       })
       return result.card
     } catch (executeError) {
@@ -1473,6 +1480,7 @@ function ActionCard({ ctx, actionId, streaming }) {
     if (
       [
         'INTERCOM_CUSTOMER_REPLY',
+        'INTERCOM_CUSTOMER_EMAIL',
         'INTERCOM_VENDOR_EMAIL',
         'KEPLER_INFO_REQUEST'
       ].includes(approved.metadata?.channel)
@@ -1588,6 +1596,16 @@ function ActionCard({ ctx, actionId, streaming }) {
     'SUPERSEDED'
   ].includes(card.status)
   const actionAllowed = criticAllowsAction(card, runtime, dirty)
+  const deliveryConversationUrl =
+    typeof card.metadata?.delivery?.conversationUrl === 'string'
+      ? card.metadata.delivery.conversationUrl
+      : ''
+  const recipientEmail =
+    typeof card.metadata?.customerEmail === 'string'
+      ? card.metadata.customerEmail
+      : typeof card.metadata?.delivery?.recipientEmail === 'string'
+        ? card.metadata.delivery.recipientEmail
+        : ''
 
   return jsxs('section', {
     style: cardStyle,
@@ -1611,7 +1629,9 @@ function ActionCard({ ctx, actionId, streaming }) {
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap'
                 },
-                children: `Destinataire : ${card.recipientLabel} · ${card.language.toUpperCase()}`
+                children: `Destinataire : ${card.recipientLabel}${
+                  recipientEmail ? ` · ${recipientEmail}` : ''
+                } · ${card.language.toUpperCase()}`
               })
             ]
           }),
@@ -1627,7 +1647,10 @@ function ActionCard({ ctx, actionId, streaming }) {
       jsxs('div', {
         style: bodyStyle,
         children: [
-          card.kind === 'VENDOR_SIDE_CONVERSATION'
+          [
+            'INTERCOM_VENDOR_EMAIL',
+            'INTERCOM_CUSTOMER_EMAIL'
+          ].includes(card.metadata?.channel)
             ? jsx(Input, {
                 value: subject,
                 disabled: !canEdit || Boolean(working),
@@ -1861,6 +1884,18 @@ function ActionCard({ ctx, actionId, streaming }) {
           jsxs('div', {
             style: rowStyle,
             children: [
+              deliveryConversationUrl
+                ? jsx(Button, {
+                    size: 'sm',
+                    variant: 'secondary',
+                    onClick: () =>
+                      void ctx.os.openExternal(
+                        deliveryConversationUrl
+                      ),
+                    children:
+                      'Ouvrir la nouvelle conversation Intercom'
+                  })
+                : null,
               ['APPROVED', 'COPIED'].includes(card.status) &&
               (card.metadata?.channel === 'INTERCOM_SIDE_CONVERSATION' ||
                 card.metadata?.channel === 'INTERCOM_CUSTOMER_REPLY')
@@ -1876,6 +1911,7 @@ function ActionCard({ ctx, actionId, streaming }) {
                 : null,
               [
                 'INTERCOM_CUSTOMER_REPLY',
+                'INTERCOM_CUSTOMER_EMAIL',
                 'INTERCOM_VENDOR_EMAIL',
                 'KEPLER_INFO_REQUEST'
               ].includes(card.metadata?.channel) &&
