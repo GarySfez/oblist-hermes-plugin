@@ -1,6 +1,7 @@
 """Authenticated proxy for The Oblist inline action cards."""
 
 import asyncio
+from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
@@ -51,6 +52,10 @@ _MANAGED_PLUGIN_COMMIT_RE = re.compile(r"^[a-f0-9]{40}$")
 _MANAGED_PLUGIN_REVISION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _MANAGED_PLUGIN_UPDATE_LOCK = asyncio.Lock()
 _MANAGED_PLUGIN_WATCH_TASK: asyncio.Task | None = None
+_REQUEST_OPERATOR_SCOPE: ContextVar[str] = ContextVar(
+    "oblist_operator_scope",
+    default="global",
+)
 _AI_OPS_API_PATHS = {
     "runtime_handshake": "/v1/release/handshake",
     "plugin_release": "/v1/plugin-release",
@@ -328,19 +333,64 @@ def _authorized_operator(request: Request, requested: str) -> str:
     requested = _validated_operator(requested)
     email = _session_email(request)
     if email in _ADMIN_EMAILS:
+        _REQUEST_OPERATOR_SCOPE.set(requested or "global")
         return requested
     operator = _OPERATOR_BY_EMAIL.get(email)
     if not operator:
         raise HTTPException(status_code=403, detail="Operator access denied")
     if requested and requested != operator:
         raise HTTPException(status_code=403, detail="Cross-profile access denied")
+    _REQUEST_OPERATOR_SCOPE.set(operator)
     return operator
 
 
-def _require_oblist_operator(request: Request) -> None:
+def _require_oblist_operator(request: Request) -> str:
     email = _session_email(request)
     if email not in _ADMIN_EMAILS and email not in _OPERATOR_BY_EMAIL:
         raise HTTPException(status_code=403, detail="Operator access denied")
+    operator = (
+        "global"
+        if email in _ADMIN_EMAILS
+        else _OPERATOR_BY_EMAIL[email]
+    )
+    _REQUEST_OPERATOR_SCOPE.set(operator)
+    return operator
+
+
+def _profile_action_token(operator: str) -> str:
+    if operator in {"lyse", "philippine"}:
+        explicit = os.environ.get(
+            f"OBLIST_{operator.upper()}_ACTION_CARD_TOKEN",
+            "",
+        ).strip()
+        if explicit:
+            return explicit
+        home_root = _MANAGED_PLUGIN_ROOT.parent.parent
+        profiles_root = (
+            home_root.parent
+            if home_root.name in _MANAGED_PLUGIN_PROFILE_NAMES
+            and home_root.parent.name == "profiles"
+            else home_root / "profiles"
+        )
+        profile_env = profiles_root / operator / ".env"
+        if profile_env.is_file():
+            for raw_line in profile_env.read_text(
+                encoding="utf-8",
+            ).splitlines():
+                key, separator, value = raw_line.partition("=")
+                if (
+                    separator
+                    and key.strip() == "OBLIST_ACTION_MCP_TOKEN"
+                    and value.strip()
+                ):
+                    return value.strip()
+        raise RuntimeError(
+            f"No scoped action-card token is configured for {operator}"
+        )
+    return (
+        os.environ.get("OBLIST_ACTION_CARD_REVIEW_TOKEN", "")
+        or os.environ.get("MCP_OBLIST_ACTIONS_API_KEY", "")
+    ).strip()
 
 
 def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) -> dict:
@@ -348,10 +398,7 @@ def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) ->
         "OBLIST_MEMORY_API_URL",
         "https://ai-ops-memory-api-production.up.railway.app",
     ).rstrip("/")
-    token = (
-        os.environ.get("OBLIST_ACTION_CARD_REVIEW_TOKEN", "")
-        or os.environ.get("MCP_OBLIST_ACTIONS_API_KEY", "")
-    )
+    token = _profile_action_token(_REQUEST_OPERATOR_SCOPE.get())
     if not token:
         raise RuntimeError("No action-card gateway token is configured")
     contract = _release_contract()
