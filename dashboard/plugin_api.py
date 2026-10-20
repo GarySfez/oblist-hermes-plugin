@@ -35,8 +35,11 @@ _PREFLIGHT_CACHE: dict[
 _PLUGIN_VERSION = "0.4.0"
 _RELEASE_EPOCH = "hermes-intelligence-v2"
 _MANAGED_PLUGIN_REPOSITORY = "GarySfez/oblist-hermes-plugin"
+_MANAGED_PLUGIN_NAME = "oblist-action-cards"
 _MANAGED_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_MANAGED_PLUGIN_PROFILE_NAMES = ("global", "lyse", "philippine")
 _MANAGED_PLUGIN_COMMIT_RE = re.compile(r"^[a-f0-9]{40}$")
+_MANAGED_PLUGIN_REVISION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _MANAGED_PLUGIN_UPDATE_LOCK = asyncio.Lock()
 _MANAGED_PLUGIN_WATCH_TASK: asyncio.Task | None = None
 _AI_OPS_API_PATHS = {
@@ -455,10 +458,57 @@ def _require_live_runtime() -> dict:
     return runtime
 
 
-def _current_managed_plugin_commit() -> str | None:
+def _managed_plugin_homes() -> tuple[Path, ...]:
+    configured_home = Path(
+        os.environ.get(
+            "HERMES_HOME",
+            str(_MANAGED_PLUGIN_ROOT.parent.parent),
+        )
+    ).expanduser().resolve()
+    candidates = [
+        configured_home,
+        *[
+            configured_home / "profiles" / profile
+            for profile in _MANAGED_PLUGIN_PROFILE_NAMES
+        ],
+        _MANAGED_PLUGIN_ROOT.parent.parent.resolve(),
+    ]
+    homes: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        home = candidate.resolve()
+        plugin_root = home / "plugins" / _MANAGED_PLUGIN_NAME
+        if home in seen or not plugin_root.is_dir():
+            continue
+        seen.add(home)
+        homes.append(home)
+    return tuple(homes)
+
+
+def _managed_plugin_home_label(home: Path) -> str:
+    configured_home = Path(
+        os.environ.get(
+            "HERMES_HOME",
+            str(_MANAGED_PLUGIN_ROOT.parent.parent),
+        )
+    ).expanduser().resolve()
+    if home == configured_home:
+        return "default"
+    try:
+        relative = home.relative_to(configured_home / "profiles")
+    except ValueError:
+        return home.name
+    return relative.parts[0] if len(relative.parts) == 1 else home.name
+
+
+def _managed_plugin_root(home: Path) -> Path:
+    return home / "plugins" / _MANAGED_PLUGIN_NAME
+
+
+def _managed_plugin_commit_at(plugin_root: Path) -> str | None:
     try:
         head = (
-            _MANAGED_PLUGIN_ROOT / ".git" / "HEAD"
+            plugin_root / ".git" / "HEAD"
         ).read_text(encoding="utf-8").strip().lower()
     except OSError:
         return None
@@ -471,20 +521,44 @@ def _current_managed_plugin_commit() -> str | None:
         return None
     try:
         commit = (
-            _MANAGED_PLUGIN_ROOT / ".git" / ref
+            plugin_root / ".git" / ref
         ).read_text(encoding="utf-8").strip().lower()
     except OSError:
         return None
     return commit if _MANAGED_PLUGIN_COMMIT_RE.fullmatch(commit) else None
 
 
-def _managed_plugin_release() -> dict:
+def _managed_plugin_commits() -> dict[str, str | None]:
+    return {
+        _managed_plugin_home_label(home): _managed_plugin_commit_at(
+            _managed_plugin_root(home)
+        )
+        for home in _managed_plugin_homes()
+    }
+
+
+def _current_managed_plugin_commit() -> str | None:
+    commits = tuple(_managed_plugin_commits().values())
+    if (
+        not commits
+        or commits[0] is None
+        or any(commit != commits[0] for commit in commits[1:])
+    ):
+        return None
+    return commits[0]
+
+
+def _managed_plugin_release(current_revision: str | None = None) -> dict:
     current_commit = _current_managed_plugin_commit()
-    query = urllib.parse.urlencode(
-        {"currentCommit": current_commit}
-        if current_commit
-        else {}
-    )
+    query_values: dict[str, str] = {}
+    if current_commit:
+        query_values["currentCommit"] = current_commit
+    if (
+        isinstance(current_revision, str)
+        and _MANAGED_PLUGIN_REVISION_RE.fullmatch(current_revision)
+    ):
+        query_values["currentRevision"] = current_revision
+    query = urllib.parse.urlencode(query_values)
     path = _api_path("plugin_release")
     payload = _request_ai_ops(f"{path}?{query}" if query else path)
     if (
@@ -503,14 +577,15 @@ def _managed_plugin_release() -> dict:
     return {
         **payload,
         "currentCommit": current_commit,
+        "installedCommits": _managed_plugin_commits(),
+        "currentRevision": current_revision,
         "updateAvailable": (
-            target_commit is not None
-            and current_commit != target_commit
+            payload.get("updateAvailable") is True
         ),
         "applyAllowed": (
             payload.get("available") is True
             and target_commit is not None
-            and current_commit != target_commit
+            and payload.get("applyAllowed") is True
         ),
     }
 
@@ -525,9 +600,7 @@ def _hermes_cli() -> str:
     return executable
 
 
-def _install_managed_plugin(target_commit: str) -> None:
-    if not _MANAGED_PLUGIN_COMMIT_RE.fullmatch(target_commit):
-        raise RuntimeError("Managed plugin release commit is invalid")
+def _run_managed_plugin_install(home: Path, target_commit: str) -> None:
     try:
         result = subprocess.run(
             [
@@ -545,7 +618,11 @@ def _install_managed_plugin(target_commit: str) -> None:
             capture_output=True,
             text=True,
             timeout=300,
-            cwd="/opt/data",
+            cwd=str(home),
+            env={
+                **os.environ,
+                "HERMES_HOME": str(home),
+            },
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError("Managed plugin update timed out") from error
@@ -553,15 +630,67 @@ def _install_managed_plugin(target_commit: str) -> None:
         raise RuntimeError("Managed plugin update could not start") from error
     if result.returncode != 0:
         raise RuntimeError("Managed plugin update failed")
-    if _current_managed_plugin_commit() != target_commit:
+    if (
+        _managed_plugin_commit_at(_managed_plugin_root(home))
+        != target_commit
+    ):
         raise RuntimeError("Managed plugin update verification failed")
+
+
+def _install_managed_plugin(target_commit: str) -> list[str]:
+    if not _MANAGED_PLUGIN_COMMIT_RE.fullmatch(target_commit):
+        raise RuntimeError("Managed plugin release commit is invalid")
+    homes = _managed_plugin_homes()
+    if not homes:
+        raise RuntimeError("Managed plugin installation is unavailable")
+    previous_commits = {
+        home: _managed_plugin_commit_at(_managed_plugin_root(home))
+        for home in homes
+    }
+    updated: list[Path] = []
+    try:
+        for home in homes:
+            updated.append(home)
+            _run_managed_plugin_install(home, target_commit)
+    except Exception as install_error:
+        rollback_failed = False
+        for home in reversed(updated):
+            previous_commit = previous_commits.get(home)
+            if not previous_commit:
+                rollback_failed = True
+                continue
+            try:
+                _run_managed_plugin_install(home, previous_commit)
+            except Exception:
+                rollback_failed = True
+        if rollback_failed:
+            raise RuntimeError(
+                "Managed plugin update failed and rollback was incomplete"
+            ) from install_error
+        raise RuntimeError(
+            "Managed plugin update failed and was rolled back"
+        ) from install_error
+    installed_commits = _managed_plugin_commits()
+    if (
+        len(installed_commits) != len(homes)
+        or any(
+            commit != target_commit
+            for commit in installed_commits.values()
+        )
+    ):
+        raise RuntimeError("Managed plugin profiles are not aligned")
+    return list(installed_commits)
 
 
 async def _apply_managed_plugin_release(
     expected_commit: str | None = None,
+    current_revision: str | None = None,
 ) -> dict:
     async with _MANAGED_PLUGIN_UPDATE_LOCK:
-        release = await asyncio.to_thread(_managed_plugin_release)
+        release = await asyncio.to_thread(
+            _managed_plugin_release,
+            current_revision,
+        )
         target_commit = release.get("targetCommit")
         if (
             release.get("applyAllowed") is not True
@@ -574,16 +703,18 @@ async def _apply_managed_plugin_release(
             raise ManagedPluginReleaseUnavailableError(
                 "Managed plugin release is no longer available"
             )
-        await asyncio.to_thread(
+        installed_profiles = await asyncio.to_thread(
             _install_managed_plugin,
             target_commit,
         )
     return {
         "ok": True,
         "installedCommit": target_commit,
+        "installedProfiles": installed_profiles,
         "releaseLabel": release.get("releaseLabel"),
-        "reloaded": True,
+        "reloaded": False,
         "restarting": False,
+        "desktopInstallRequired": True,
     }
 
 
@@ -690,8 +821,19 @@ async def get_runtime(request: Request):
 @router.get("/plugin-release")
 async def get_plugin_release(request: Request):
     _require_oblist_operator(request)
+    current_revision = request.query_params.get("currentRevision")
+    if current_revision is not None and not _MANAGED_PLUGIN_REVISION_RE.fullmatch(
+        current_revision
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid plugin revision",
+        )
     try:
-        return await asyncio.to_thread(_managed_plugin_release)
+        return await asyncio.to_thread(
+            _managed_plugin_release,
+            current_revision,
+        )
     except Exception as error:
         raise HTTPException(
             status_code=503,
@@ -708,13 +850,25 @@ async def apply_plugin_release(body: dict, request: Request):
         or not _MANAGED_PLUGIN_COMMIT_RE.fullmatch(expected_commit)
     ):
         raise HTTPException(status_code=400, detail="Invalid plugin release")
+    current_revision = body.get("currentRevision")
+    if (
+        current_revision is not None
+        and (
+            not isinstance(current_revision, str)
+            or not _MANAGED_PLUGIN_REVISION_RE.fullmatch(current_revision)
+        )
+    ):
+        raise HTTPException(status_code=400, detail="Invalid plugin revision")
     if _MANAGED_PLUGIN_UPDATE_LOCK.locked():
         raise HTTPException(
             status_code=409,
             detail="Une mise à jour est déjà en cours.",
         )
     try:
-        return await _apply_managed_plugin_release(expected_commit)
+        return await _apply_managed_plugin_release(
+            expected_commit,
+            current_revision,
+        )
     except ManagedPluginReleaseUnavailableError as error:
         raise HTTPException(
             status_code=409,

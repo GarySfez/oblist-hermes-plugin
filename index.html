@@ -94,6 +94,7 @@
         prioritized CS alerts and Resolve now.
       </p>
       <a
+        id="install"
         class="button"
         href="hermes://plugin/install?repo=GarySfez/oblist-hermes-plugin&amp;enable=1&amp;force=1"
       >
@@ -104,5 +105,14 @@
         credentials or customer data.
       </small>
     </main>
+    <script>
+      const install = document.getElementById("install");
+      if (
+        install &&
+        new URLSearchParams(window.location.search).get("update") === "1"
+      ) {
+        window.location.replace(install.href);
+      }
+    </script>
   </body>
 </html>

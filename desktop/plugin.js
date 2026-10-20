@@ -25,9 +25,13 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const GIT_COMMIT_RE = /^[a-f0-9]{40}$/
+const PLUGIN_REVISION_RE = /^[A-Za-z0-9._-]{1,64}$/
 
 const PLUGIN_VERSION = '0.4.0'
+const PLUGIN_RELEASE_REVISION = '2026.10.20.1'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
+const MANAGED_PLUGIN_INSTALLER_URL =
+  'https://garysfez.github.io/oblist-hermes-plugin/?update=1'
 const API_PATHS = Object.freeze({
   runtime: '/runtime',
   pluginRelease: '/plugin-release',
@@ -214,6 +218,11 @@ function normalizeManagedPluginRelease(value) {
     GIT_COMMIT_RE.test(value.targetCommit)
       ? value.targetCommit
       : null
+  const targetRevision =
+    typeof value.targetRevision === 'string' &&
+    PLUGIN_REVISION_RE.test(value.targetRevision)
+      ? value.targetRevision
+      : null
   return {
     policy: ['OFF', 'NOTIFY', 'AUTO'].includes(value.policy)
       ? value.policy
@@ -223,6 +232,12 @@ function normalizeManagedPluginRelease(value) {
         ? value.releaseLabel.slice(0, 100)
         : 'Mise à jour The Oblist',
     targetCommit,
+    targetRevision,
+    currentRevision:
+      typeof value.currentRevision === 'string' &&
+      PLUGIN_REVISION_RE.test(value.currentRevision)
+        ? value.currentRevision
+        : null,
     currentCommit:
       typeof value.currentCommit === 'string' &&
       GIT_COMMIT_RE.test(value.currentCommit)
@@ -252,7 +267,12 @@ async function refreshManagedPluginRelease(ctx, force = false) {
   let request = managedPluginReleaseRequests.get(connectionKey)
   if (!request) {
     request = ctx
-      .rest(API_PATHS.pluginRelease, { timeoutMs: 20_000 })
+      .rest(
+        `${API_PATHS.pluginRelease}?currentRevision=${encodeURIComponent(
+          PLUGIN_RELEASE_REVISION
+        )}`,
+        { timeoutMs: 20_000 }
+      )
       .then(normalizeManagedPluginRelease)
       .finally(() => managedPluginReleaseRequests.delete(connectionKey))
     managedPluginReleaseRequests.set(connectionKey, request)
@@ -448,7 +468,7 @@ function ManagedPluginUpdateStatus({ ctx }) {
   const [error, setError] = useState('')
   const release = managed.release
 
-  if (managed.state === 'updated') {
+  if (managed.state === 'handoff') {
     return jsxs('div', {
       role: 'status',
       style: {
@@ -463,7 +483,7 @@ function ManagedPluginUpdateStatus({ ctx }) {
       },
       children: [
         jsx('strong', {
-          children: 'Mise à jour installée'
+          children: 'Mise à jour prête à installer'
         }),
         jsx('span', {
           style: {
@@ -472,7 +492,7 @@ function ManagedPluginUpdateStatus({ ctx }) {
             lineHeight: 1.45
           },
           children:
-            'L’interface The Oblist a été rechargée à chaud. Vous pouvez continuer sans vous reconnecter.'
+            'Confirmez « Installer » dans la fenêtre Hermes ouverte. L’interface se rechargera à chaud sans fermer votre session.'
         })
       ]
     })
@@ -487,18 +507,27 @@ function ManagedPluginUpdateStatus({ ctx }) {
     try {
       await ctx.rest(API_PATHS.pluginReleaseApply, {
         method: 'POST',
-        body: { expectedCommit: release.targetCommit },
-        timeoutMs: 330_000
+        body: {
+          expectedCommit: release.targetCommit,
+          currentRevision: PLUGIN_RELEASE_REVISION
+        },
+        timeoutMs: 600_000
       })
+      const opened = await ctx.os.openExternal(
+        MANAGED_PLUGIN_INSTALLER_URL
+      )
+      if (!opened) {
+        throw new Error('PLUGIN_INSTALLER_UNAVAILABLE')
+      }
       managedPluginReleaseAtom.set({
         ...managedPluginReleaseAtom.get(),
-        state: 'updated',
+        state: 'handoff',
         error: ''
       })
       host.notify({
-        kind: 'success',
+        kind: 'info',
         message:
-          'Mise à jour installée sans interrompre votre session.'
+          'Confirmez maintenant l’installation dans Hermes.'
       })
     } catch (installError) {
       setError(
@@ -507,6 +536,7 @@ function ManagedPluginUpdateStatus({ ctx }) {
           'La mise à jour n’a pas pu être installée. La version actuelle reste active.',
         )
       )
+    } finally {
       setInstalling(false)
     }
   }
@@ -578,7 +608,7 @@ function ManagedPluginUpdateStatus({ ctx }) {
                   fontSize: '11px'
                 },
                 children:
-                  'L’installation et le rechargement sont automatiques.'
+                  'Un clic ouvre l’installateur sécurisé ; confirmez ensuite « Installer ». Aucun redémarrage n’est nécessaire.'
               }),
           jsx(Button, {
             size: 'sm',
@@ -586,8 +616,8 @@ function ManagedPluginUpdateStatus({ ctx }) {
               installing || release.applyAllowed !== true,
             onClick: () => void install(),
             children: installing
-              ? 'Installation…'
-              : 'Mettre à jour'
+              ? 'Préparation…'
+              : 'Ouvrir la mise à jour'
           })
         ]
       })

@@ -14,10 +14,11 @@ authenticated Nous session and is checked again by AI Ops.
 
 After the one-time bootstrap installation, the plugin checks the authenticated
 The Oblist release channel. Only the exact commit approved by AI Ops can be
-installed. A `NOTIFY` release appears in **Accueil CS** with one
-**Mettre à jour** button; an `AUTO` release is installed by the Agent process.
-The official Hermes installer performs the replacement, verifies the checked
-out commit, then Hermes hot-reloads the Agent and Desktop surfaces without
+installed. A release appears in **Accueil CS** with one
+**Ouvrir la mise à jour** button. The Agent copies for Global, Lyse and
+Philippine are aligned as one operation and rolled back together on failure.
+Hermes then opens its official local installer: the CS confirms **Installer**
+once and Desktop hot-reloads the interface without restarting the app or
 ending the remote browser session.
 
 The release channel can target Global, Lyse and Philippine independently.
