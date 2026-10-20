@@ -807,9 +807,7 @@ function normalizeCriticReview(card) {
 
 function criticAllowsAction(card, runtime, dirty = false) {
   if (runtimeBlocksV2(runtime)) return false
-  if (!isV2Live(runtime)) return true
-  const review = normalizeCriticReview(card)
-  return !dirty && review?.current === true && review.verdict === 'PASS'
+  return !dirty
 }
 
 function CriticStatus({ card, runtime, dirty }) {
@@ -836,10 +834,10 @@ function CriticStatus({ card, runtime, dirty }) {
   }
   const message =
     review?.current && review.verdict === 'REVISE'
-      ? 'Hermes doit corriger ce brouillon avant qu’il puisse être confirmé.'
+      ? 'La vérification recommande de corriger ce brouillon avant confirmation.'
       : review?.current && review.verdict === 'BLOCK'
-        ? 'Cette action reste bloquée car une vérification a identifié un risque.'
-        : 'La vérification requise n’est pas disponible pour cette version du brouillon. Cette action reste bloquée.'
+        ? 'La vérification a identifié un risque. Relisez le brouillon avant de confirmer.'
+        : 'La vérification automatique n’est pas disponible. Relisez le brouillon avant de confirmer.'
   return jsx('div', {
     role: 'alert',
     style: {
