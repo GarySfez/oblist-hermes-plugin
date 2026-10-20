@@ -112,10 +112,7 @@
         install.href =
           "hermes://plugin-desktop/install?repo=GarySfez/oblist-hermes-plugin&enable=1&force=1";
       }
-      if (
-        install &&
-        query.get("update") === "1"
-      ) {
+      if (install && query.get("update") === "1") {
         window.location.replace(install.href);
       }
     </script>

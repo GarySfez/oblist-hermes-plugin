@@ -22,6 +22,15 @@ _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
+_VISION_PAYLOAD_REF_RE = re.compile(
+    r"^vision-ui:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_VISION_STABLE_REF_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,499}$"
+)
+_VISION_ATTACHMENT_REF_LIMIT = 12
 _ADMIN_EMAILS = {"garysfez@oblist.com"}
 _OPERATOR_BY_EMAIL = {
     "lyse@oblist.com": "lyse",
@@ -32,7 +41,7 @@ _PREFLIGHT_CACHE: dict[
     tuple[str, str, str],
     tuple[float, int, bool],
 ] = {}
-_PLUGIN_VERSION = "0.4.0"
+_PLUGIN_VERSION = "0.5.0"
 _RELEASE_EPOCH = "hermes-intelligence-v2"
 _MANAGED_PLUGIN_REPOSITORY = "GarySfez/oblist-hermes-plugin"
 _MANAGED_PLUGIN_NAME = "oblist-action-cards"
@@ -67,6 +76,8 @@ _AI_OPS_API_PATHS = {
         "/v1/case-watches/{workflow_id}/claim/release"
     ),
     "workflow_closure": "/v1/case-watches/{workflow_id}/closure",
+    "vision_payload": "/v1/vision-payloads/{payload_ref}",
+    "attachment_links": "/v1/attachments/links",
 }
 _RELEASE_CONTRACT_PATH = Path(__file__).with_name("release_contract.json")
 
@@ -812,6 +823,165 @@ def _validated_operator(value: str) -> str:
     if value not in {"", "lyse", "philippine"}:
         raise HTTPException(status_code=400, detail="Invalid operator")
     return value
+
+
+def _validated_vision_ref(
+    value: object,
+    field_name: str,
+    pattern: re.Pattern,
+) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or ".." in value
+        or value.lower().startswith(
+            ("http:", "https:", "data:", "file:", "javascript:")
+        )
+        or not pattern.fullmatch(value)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {field_name}",
+        )
+    return value
+
+
+def _validated_vision_query(request: Request) -> str:
+    query = request.query_params
+    if set(query.keys()) != {"caseRef"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid vision payload query",
+        )
+    getlist = getattr(query, "getlist", None)
+    if callable(getlist) and len(getlist("caseRef")) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid vision payload query",
+        )
+    return _validated_vision_ref(
+        query.get("caseRef"),
+        "case reference",
+        _VISION_STABLE_REF_RE,
+    )
+
+
+def _validated_attachment_link_request(body: object) -> dict:
+    if not isinstance(body, dict) or set(body) != {
+        "payloadRef",
+        "caseRef",
+        "attachmentRefs",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid attachment link request",
+        )
+    payload_ref = _validated_vision_ref(
+        body.get("payloadRef"),
+        "vision payload reference",
+        _VISION_PAYLOAD_REF_RE,
+    )
+    case_ref = _validated_vision_ref(
+        body.get("caseRef"),
+        "case reference",
+        _VISION_STABLE_REF_RE,
+    )
+    attachment_refs = body.get("attachmentRefs")
+    if (
+        not isinstance(attachment_refs, list)
+        or not 1 <= len(attachment_refs) <= _VISION_ATTACHMENT_REF_LIMIT
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid attachment references",
+        )
+    validated_refs = [
+        _validated_vision_ref(
+            attachment_ref,
+            "attachment reference",
+            _VISION_STABLE_REF_RE,
+        )
+        for attachment_ref in attachment_refs
+    ]
+    if len(set(validated_refs)) != len(validated_refs):
+        raise HTTPException(
+            status_code=400,
+            detail="Duplicate attachment references",
+        )
+    return {
+        "payloadRef": payload_ref,
+        "caseRef": case_ref,
+        "attachmentRefs": validated_refs,
+    }
+
+
+async def _request_vision_ai_ops(
+    path: str,
+    method: str = "GET",
+    body: dict | None = None,
+) -> dict:
+    try:
+        return await asyncio.to_thread(
+            _request_ai_ops,
+            path,
+            method,
+            body,
+        )
+    except HTTPException as error:
+        if error.status_code == 400:
+            detail = "Invalid visual context request"
+        elif error.status_code == 404:
+            detail = "Visual context not found or expired"
+        elif error.status_code == 429:
+            detail = "Visual context temporarily unavailable"
+        else:
+            raise HTTPException(
+                status_code=502,
+                detail="Visual context service unavailable",
+            ) from error
+        raise HTTPException(
+            status_code=error.status_code,
+            detail=detail,
+        ) from error
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail="Visual context service unavailable",
+        ) from error
+
+
+@router.get("/v1/vision-payloads/{payload_ref}")
+async def get_vision_payload(
+    payload_ref: str,
+    request: Request,
+):
+    _require_oblist_operator(request)
+    payload_ref = _validated_vision_ref(
+        payload_ref,
+        "vision payload reference",
+        _VISION_PAYLOAD_REF_RE,
+    )
+    case_ref = _validated_vision_query(request)
+    encoded_payload_ref = urllib.parse.quote(payload_ref, safe="")
+    query = urllib.parse.urlencode({"caseRef": case_ref})
+    return await _request_vision_ai_ops(
+        f"{_api_path('vision_payload', payload_ref=encoded_payload_ref)}"
+        f"?{query}"
+    )
+
+
+@router.post("/v1/attachments/links")
+async def refresh_attachment_links(
+    body: dict,
+    request: Request,
+):
+    _require_oblist_operator(request)
+    payload = _validated_attachment_link_request(body)
+    return await _request_vision_ai_ops(
+        _api_path("attachment_links"),
+        "POST",
+        payload,
+    )
 
 
 @router.get("/runtime")

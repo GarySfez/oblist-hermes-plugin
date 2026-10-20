@@ -26,9 +26,55 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const GIT_COMMIT_RE = /^[a-f0-9]{40}$/
 const PLUGIN_REVISION_RE = /^[A-Za-z0-9._-]{1,64}$/
+const VISION_UI_CONTRACT_VERSION = '1.0.0'
+const VISION_DIRECTIVE_NAME = 'oblist-vision'
+const VISION_PAYLOAD_ORIGIN = 'AUTHENTICATED_API'
+const VISION_PARSED_PAYLOAD = Symbol('oblist-vision-parsed-payload')
+const VISION_PRODUCT_LIMIT = 6
+const VISION_ATTACHMENT_VISIBLE_LIMIT = 8
+const VISION_HIDE_STORAGE_PREFIX = 'oblist-vision-products-hidden:v1'
+const VISION_PAYLOAD_CACHE_MS = 30_000
+const VISION_PAYLOAD_CACHE_LIMIT = 64
+const VISION_LINK_CACHE_MS = 30_000
+const VISION_LINK_CACHE_LIMIT = 128
+const VISION_PENDING_STATUSES = new Set([
+  'DISCOVERED',
+  'QUEUED',
+  'DOWNLOADING',
+  'SCANNING',
+  'ANALYZING'
+])
+const VISION_FAILED_STATUSES = new Set([
+  'FAILED',
+  'TIMED_OUT',
+  'DLQ'
+])
+const VISION_TERMINAL_STATUSES = new Set([
+  'READY',
+  'LINK_ONLY',
+  'UNSUPPORTED',
+  ...VISION_FAILED_STATUSES
+])
+const VISION_SIGNED_QUERY_PARAMETERS = new Set([
+  'expires',
+  'key-pair-id',
+  'policy',
+  'signature',
+  'token',
+  'x-amz-credential',
+  'x-amz-date',
+  'x-amz-expires',
+  'x-amz-security-token',
+  'x-amz-signature'
+])
+const visionRenderedAutoContexts = new Set()
+const visionPayloadCache = new Map()
+const visionPayloadRequests = new Map()
+const visionAttachmentLinkCache = new Map()
+const visionAttachmentLinkRequests = new Map()
 
-const PLUGIN_VERSION = '0.4.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.20.4'
+const PLUGIN_VERSION = '0.5.0'
+const PLUGIN_RELEASE_REVISION = '2026.10.20.5'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
   'https://garysfez.github.io/oblist-hermes-plugin/?update=1&desktop=1'
@@ -53,7 +99,12 @@ const API_PATHS = Object.freeze({
     `/workflows/${workflowId}/confirm-assignment`,
   workflowRelease: workflowId =>
     `/workflows/${workflowId}/release`,
-  workflowClosure: workflowId => `/workflows/${workflowId}/closure`
+  workflowClosure: workflowId => `/workflows/${workflowId}/closure`,
+  visionPayload: (payloadRef, caseRef) =>
+    `/v1/vision-payloads/${encodeURIComponent(
+      payloadRef
+    )}?caseRef=${encodeURIComponent(caseRef)}`,
+  attachmentLinks: '/v1/attachments/links'
 })
 
 const V1_RUNTIME = Object.freeze({
@@ -2182,6 +2233,3129 @@ function usePrefersReducedMotion() {
   return reduced
 }
 
+/*
+ * Vision UI fan-in contract (Desktop only)
+ *
+ * Transcript directive:
+ *   ::oblist-vision{payloadRef="vision-ui:…" caseRef="case:…"}
+ *
+ * The directive deliberately contains no JSON and no URL. The authenticated
+ * fan-in must resolve payloadRef and provide the following object out-of-band
+ * as the renderer's `payload` value (notifications/briefs may expose the same
+ * object as `visionUi` in their already-authenticated API response):
+ *
+ * {
+ *   uiContractVersion: "1.0.0",
+ *   origin: "AUTHENTICATED_API",
+ *   payloadRef, caseRef, generatedAt,
+ *   permissions: { canViewInternalAttachments: boolean },
+ *   attachmentBundle: AttachmentAnalysisBundleV1 | null,
+ *   productCards: ProductContextCard[],              // max 6 rendered
+ *   conformityComparisons: ProductConformityComparison[],
+ *   attachmentLinks: [{
+ *     attachmentRef,
+ *     previewUrl?, openAttachmentUrl?, openSourceUrl?,
+ *     width?, height?, expiresAt?
+ *   }]
+ * }
+ *
+ * Attachment links are short-lived API output and never accepted from
+ * transcript attrs. Missing structuredContent is hydrated only through
+ * ctx.rest and the authenticated ref-only routes declared in API_PATHS.
+ */
+function isVisionRecord(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value)
+  )
+}
+
+function visionString(value, max = 1_000, nullable = false) {
+  if (typeof value !== 'string') return nullable ? null : ''
+  const normalized = value.trim()
+  if (
+    !normalized ||
+    normalized.length > max ||
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(normalized)
+  ) {
+    return nullable ? null : ''
+  }
+  return normalized
+}
+
+function visionRef(value) {
+  return visionString(value, 500)
+}
+
+function visionIsoDate(value) {
+  const normalized = visionString(value, 100)
+  if (!normalized) return null
+  const parsed = Date.parse(normalized)
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null
+}
+
+function visionConfidence(value) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1
+    ? parsed
+    : null
+}
+
+function visionEnum(value, allowed, fallback = null) {
+  return allowed.includes(value) ? value : fallback
+}
+
+function visionHttpsUrl(
+  value,
+  { allowSigned = false, shopifyImage = false } = {}
+) {
+  if (typeof value !== 'string' || value.length > 2_048) return null
+  try {
+    const url = new URL(value)
+    if (
+      url.protocol !== 'https:' ||
+      url.username ||
+      url.password ||
+      url.hash
+    ) {
+      return null
+    }
+    if (!allowSigned) {
+      for (const parameter of url.searchParams.keys()) {
+        if (
+          VISION_SIGNED_QUERY_PARAMETERS.has(parameter.toLowerCase())
+        ) {
+          return null
+        }
+      }
+    }
+    if (shopifyImage) {
+      const hostName = url.hostname.toLowerCase()
+      if (
+        hostName !== 'cdn.shopify.com' &&
+        !hostName.endsWith('.shopifycdn.com') &&
+        !hostName.endsWith('.myshopify.com')
+      ) {
+        return null
+      }
+    }
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+function visionUrlHasSignedParameter(value) {
+  try {
+    const url = new URL(value)
+    return [...url.searchParams.keys()].some(parameter =>
+      VISION_SIGNED_QUERY_PARAMETERS.has(parameter.toLowerCase())
+    )
+  } catch {
+    return false
+  }
+}
+
+function normalizeVisionAuthor(value) {
+  if (!isVisionRecord(value)) return null
+  const role = visionEnum(value.role, [
+    'CUSTOMER',
+    'VENDOR',
+    'ADMIN',
+    'BOT',
+    'SYSTEM',
+    'UNVERIFIED_EXTERNAL'
+  ])
+  const identityStatus = visionEnum(value.identityStatus, [
+    'VERIFIED_CUSTOMER',
+    'VERIFIED_VENDOR',
+    'VERIFIED_ADMIN',
+    'UNVERIFIED_EXTERNAL',
+    'SYSTEM_IDENTITY',
+    'NOT_APPLICABLE'
+  ])
+  if (!role || !identityStatus) return null
+  const expectedRole = {
+    VERIFIED_CUSTOMER: 'CUSTOMER',
+    VERIFIED_VENDOR: 'VENDOR',
+    VERIFIED_ADMIN: 'ADMIN',
+    UNVERIFIED_EXTERNAL: 'UNVERIFIED_EXTERNAL'
+  }[identityStatus]
+  const authorRef = visionString(value.authorRef, 500, true)
+  if (
+    (expectedRole && role !== expectedRole) ||
+    (identityStatus.startsWith('VERIFIED_') && !authorRef)
+  ) {
+    return null
+  }
+  return {
+    role,
+    identityStatus,
+    authorRef,
+    displayName: visionString(value.displayName, 300, true)
+  }
+}
+
+function normalizeVisionDescriptor(value, expectedCaseRef) {
+  if (
+    !isVisionRecord(value) ||
+    value.contractVersion !== '1.0.0'
+  ) {
+    return null
+  }
+  const attachmentRef = visionRef(value.attachmentRef)
+  const caseRef = visionRef(value.caseRef)
+  const source = visionEnum(value.source, [
+    'INTERCOM_CONVERSATION',
+    'INTERCOM_SIDE_CONVERSATION',
+    'RETURN_PORTAL',
+    'INFO_REQUEST'
+  ])
+  const visibility = visionEnum(value.visibility, [
+    'CUSTOMER_THREAD',
+    'VENDOR_THREAD',
+    'INTERNAL'
+  ])
+  const mediaKind = visionEnum(value.mediaKind, [
+    'IMAGE',
+    'PDF',
+    'DOCUMENT',
+    'SPREADSHEET',
+    'VIDEO',
+    'AUDIO',
+    'ARCHIVE',
+    'EXECUTABLE',
+    'OTHER'
+  ])
+  const analysisDisposition = visionEnum(value.analysisDisposition, [
+    'ANALYZE',
+    'LINK_ONLY',
+    'UNSUPPORTED'
+  ])
+  const author = normalizeVisionAuthor(value.author)
+  const occurredAt = visionIsoDate(value.occurredAt)
+  const fileName = visionString(value.fileName, 1_000)
+  const sourceContainerRef = visionRef(value.sourceContainerRef)
+  const sourceMessageRef = visionRef(value.sourceMessageRef)
+  const sourceFileRef = visionRef(value.sourceFileRef)
+  const sideConversationRef = visionString(
+    value.sideConversationRef,
+    500,
+    true
+  )
+  if (
+    !attachmentRef ||
+    !caseRef ||
+    caseRef !== expectedCaseRef ||
+    !source ||
+    !visibility ||
+    !mediaKind ||
+    !analysisDisposition ||
+    !author ||
+    !occurredAt ||
+    !fileName ||
+    !sourceContainerRef ||
+    !sourceMessageRef ||
+    !sourceFileRef ||
+    (source === 'INTERCOM_SIDE_CONVERSATION' &&
+      !sideConversationRef) ||
+    (source !== 'INTERCOM_SIDE_CONVERSATION' &&
+      sideConversationRef)
+  ) {
+    return null
+  }
+  if (
+    (mediaKind === 'VIDEO' && analysisDisposition !== 'LINK_ONLY') ||
+    (mediaKind === 'EXECUTABLE' &&
+      analysisDisposition !== 'UNSUPPORTED')
+  ) {
+    return null
+  }
+  return {
+    attachmentRef,
+    caseRef,
+    source,
+    visibility,
+    mediaKind,
+    analysisDisposition,
+    author,
+    occurredAt,
+    fileName,
+    sourceContainerRef,
+    sourceMessageRef,
+    sourceFileRef,
+    sideConversationRef
+  }
+}
+
+function normalizeDerivedVisionCitations(value, attachmentRef) {
+  if (!Array.isArray(value)) return []
+  const seen = new Set()
+  return value.slice(0, 200).flatMap(citation => {
+    if (
+      !isVisionRecord(citation) ||
+      citation.authority !== 'DERIVED' ||
+      citation.sourceKind !== 'ATTACHMENT' ||
+      visionRef(citation.sourceRef) !== attachmentRef
+    ) {
+      return []
+    }
+    const citationId = visionString(citation.citationId, 100)
+    if (!citationId || seen.has(citationId)) return []
+    seen.add(citationId)
+    return [{
+      citationId,
+      sourceRef: attachmentRef,
+      excerpt: visionString(citation.excerpt, 1_500, true)
+    }]
+  })
+}
+
+function normalizeCitedVisionItems(value, citationIds, limit) {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, limit).flatMap(item => {
+    if (!isVisionRecord(item)) return []
+    const text = visionString(
+      item.text || item.description || item.question,
+      4_000
+    )
+    const refs = Array.isArray(item.citationIds)
+      ? item.citationIds
+          .map(reference => visionString(reference, 100))
+          .filter(reference => citationIds.has(reference))
+          .slice(0, 20)
+      : []
+    if (!text || refs.length === 0) return []
+    return [{
+      text,
+      confidence: visionConfidence(item.confidence),
+      citationIds: refs,
+      kind: visionString(item.kind || item.category, 100, true),
+      severity: visionString(item.severity, 100, true)
+    }]
+  })
+}
+
+function normalizeVisionInsight(value, attachmentRef) {
+  if (
+    !isVisionRecord(value) ||
+    value.contractVersion !== '1.0.0' ||
+    value.authority !== 'DERIVED' ||
+    value.status !== 'READY' ||
+    value.redacted !== true ||
+    value.untrustedContent !== true ||
+    visionRef(value.attachmentRef) !== attachmentRef
+  ) {
+    return null
+  }
+  const summary = visionString(value.summary, 4_000)
+  const citations = normalizeDerivedVisionCitations(
+    value.citations,
+    attachmentRef
+  )
+  if (!summary || citations.length === 0) return null
+  const citationIds = new Set(
+    citations.map(citation => citation.citationId)
+  )
+  return {
+    authority: 'DERIVED',
+    summary,
+    purpose: visionEnum(value.purpose, [
+      'DAMAGE_EVIDENCE',
+      'PRODUCT_CONFORMITY',
+      'PAYMENT_EVIDENCE',
+      'CUSTOMS_EVIDENCE',
+      'SHIPPING_EVIDENCE',
+      'IDENTITY_EVIDENCE',
+      'RETURN_EVIDENCE',
+      'GENERAL_CASE_EVIDENCE',
+      'UNKNOWN'
+    ], 'UNKNOWN'),
+    documentKind: visionString(value.documentKind, 100, true),
+    confidence: visionConfidence(value.confidence),
+    visualObservations: normalizeCitedVisionItems(
+      value.visualObservations,
+      citationIds,
+      100
+    ),
+    damages: normalizeCitedVisionItems(
+      value.damages,
+      citationIds,
+      50
+    ),
+    verificationChecks: normalizeCitedVisionItems(
+      value.verificationChecks,
+      citationIds,
+      50
+    ),
+    citations
+  }
+}
+
+function normalizeVisionAttachmentItem(value, expectedCaseRef) {
+  if (!isVisionRecord(value)) return null
+  const descriptor = normalizeVisionDescriptor(
+    value.descriptor,
+    expectedCaseRef
+  )
+  const declaredStatus = visionEnum(value.status, [
+    ...VISION_PENDING_STATUSES,
+    ...VISION_TERMINAL_STATUSES
+  ])
+  if (!descriptor || !declaredStatus) return null
+
+  let status =
+    descriptor.mediaKind === 'VIDEO' ? 'LINK_ONLY' : declaredStatus
+  let insight =
+    status === 'READY'
+      ? normalizeVisionInsight(
+          value.insight,
+          descriptor.attachmentRef
+        )
+      : null
+  let invalidReadyResult = false
+  if (status === 'READY' && !insight) {
+    status = 'FAILED'
+    invalidReadyResult = true
+  }
+  if (descriptor.mediaKind === 'VIDEO') insight = null
+  const actions = Array.isArray(value.freshLinkActions)
+    ? [...new Set(
+        value.freshLinkActions.filter(action =>
+          ['OPEN_ATTACHMENT', 'OPEN_SOURCE'].includes(action)
+        )
+      )].slice(0, 2)
+    : []
+  return {
+    descriptor,
+    status,
+    insight,
+    freshLinkActions: actions,
+    invalidReadyResult
+  }
+}
+
+function normalizeVisionSynthesis(value, expectedCaseRef) {
+  if (
+    !isVisionRecord(value) ||
+    value.contractVersion !== '1.0.0' ||
+    value.authority !== 'DERIVED' ||
+    value.redacted !== true ||
+    visionRef(value.caseRef) !== expectedCaseRef
+  ) {
+    return null
+  }
+  const summary = visionString(value.summary, 4_000)
+  return summary
+    ? {
+        authority: 'DERIVED',
+        summary,
+        criticalEvidenceStatus: visionEnum(
+          value.criticalEvidenceStatus,
+          ['NOT_PRESENT', 'PENDING', 'READY', 'FAILED'],
+          'NOT_PRESENT'
+        ),
+        confidence: visionConfidence(value.confidence)
+      }
+    : null
+}
+
+function normalizeVisionAttachmentBundle(value, expectedCaseRef) {
+  if (value === null || value === undefined) return null
+  if (
+    !isVisionRecord(value) ||
+    value.contractVersion !== '1.0.0' ||
+    visionRef(value.caseRef) !== expectedCaseRef
+  ) {
+    return null
+  }
+  const attachments = Array.isArray(value.attachments)
+    ? value.attachments
+        .slice(0, 100)
+        .map(item =>
+          normalizeVisionAttachmentItem(item, expectedCaseRef)
+        )
+        .filter(Boolean)
+    : []
+  const pending = attachments.filter(item =>
+    VISION_PENDING_STATUSES.has(item.status)
+  ).length
+  const ready = attachments.filter(
+    item => item.status === 'READY'
+  ).length
+  const linkOnly = attachments.filter(
+    item => item.status === 'LINK_ONLY'
+  ).length
+  const unsupported = attachments.filter(
+    item => item.status === 'UNSUPPORTED'
+  ).length
+  const failed = attachments.filter(item =>
+    VISION_FAILED_STATUSES.has(item.status)
+  ).length
+  return {
+    bundleRef: visionRef(value.bundleRef),
+    caseRef: expectedCaseRef,
+    status: visionEnum(
+      value.status,
+      ['PENDING', 'PARTIAL', 'READY', 'FAILED'],
+      pending > 0 ? 'PENDING' : failed > 0 ? 'PARTIAL' : 'READY'
+    ),
+    attachments,
+    omittedAttachmentCount:
+      Number.isInteger(value.omittedAttachmentCount) &&
+      value.omittedAttachmentCount >= 0
+        ? value.omittedAttachmentCount
+        : 0,
+    counts: {
+      total:
+        attachments.length +
+        (Number.isInteger(value.omittedAttachmentCount) &&
+        value.omittedAttachmentCount >= 0
+          ? value.omittedAttachmentCount
+          : 0),
+      pending,
+      ready,
+      linkOnly,
+      unsupported,
+      failed
+    },
+    synthesis: normalizeVisionSynthesis(
+      value.synthesis,
+      expectedCaseRef
+    )
+  }
+}
+
+function hasVisionSystemCitation(value, allowedRefs) {
+  return (
+    Array.isArray(value) &&
+    value.some(
+      citation =>
+        isVisionRecord(citation) &&
+        citation.authority === 'SYSTEM_OF_RECORD' &&
+        [
+          'ORDER_LINE_ITEM',
+          'ORDER_TIME_PRODUCT_SNAPSHOT',
+          'CURRENT_PRODUCT_PAGE'
+        ].includes(citation.sourceKind) &&
+        allowedRefs.has(visionRef(citation.sourceRef))
+    )
+  )
+}
+
+function hasVisionAttachmentCitation(value, attachmentRefs) {
+  return (
+    Array.isArray(value) &&
+    value.some(
+      citation =>
+        isVisionRecord(citation) &&
+        citation.authority === 'DERIVED' &&
+        citation.sourceKind === 'ATTACHMENT' &&
+        attachmentRefs.has(visionRef(citation.sourceRef))
+    )
+  )
+}
+
+function normalizeVisionProductCard(value) {
+  if (
+    !isVisionRecord(value) ||
+    value.contractVersion !== '1.0.0' ||
+    value.authority !== 'SYSTEM_OF_RECORD'
+  ) {
+    return null
+  }
+  const productRef = visionRef(value.productRef)
+  const orderItemRef = visionRef(value.orderItemRef)
+  const title = visionString(value.title, 1_000)
+  const vendorName = visionString(value.vendorName, 500)
+  const displayMode = visionEnum(value.displayMode, [
+    'AUTO_CONTEXT',
+    'EXPLICIT',
+    'HIDDEN'
+  ])
+  const displayReason = visionString(
+    value.displayReason,
+    1_000,
+    true
+  )
+  const catalogStatus = visionEnum(value.catalogStatus, [
+    'PUBLISHED',
+    'UNPUBLISHED',
+    'UNKNOWN'
+  ])
+  const citationRefs = new Set([productRef, orderItemRef])
+  if (
+    !productRef ||
+    !orderItemRef ||
+    !title ||
+    !vendorName ||
+    !displayMode ||
+    !catalogStatus ||
+    !hasVisionSystemCitation(value.citations, citationRefs) ||
+    (displayMode !== 'HIDDEN' && !displayReason) ||
+    !Number.isInteger(value.quantity) ||
+    value.quantity < 1 ||
+    value.quantity > 10_000
+  ) {
+    return null
+  }
+  const published = catalogStatus === 'PUBLISHED'
+  return {
+    productRef,
+    orderItemRef,
+    title,
+    vendorName,
+    variantTitle: visionString(value.variantTitle, 1_000, true),
+    quantity: value.quantity,
+    imageUrl: published
+      ? visionHttpsUrl(value.imageUrl, { shopifyImage: true })
+      : null,
+    productUrl: published
+      ? visionHttpsUrl(value.productUrl)
+      : null,
+    imageAlt:
+      visionString(value.imageAlt, 1_000) ||
+      `Photo de référence — ${title}`,
+    catalogStatus,
+    displayMode,
+    displayReason,
+    authority: 'SYSTEM_OF_RECORD'
+  }
+}
+
+function normalizeVisionMeasurement(value, attachmentRefs) {
+  if (
+    !isVisionRecord(value) ||
+    !hasVisionAttachmentCitation(value.citations, attachmentRefs)
+  ) {
+    return null
+  }
+  const name = visionString(value.name, 200)
+  const method = visionEnum(value.method, [
+    'FORM_VALUE',
+    'DOCUMENT_DIMENSION',
+    'READABLE_SCALE',
+    'UNSCALED_IMAGE'
+  ])
+  const reliability = visionEnum(value.reliability, [
+    'STRONG',
+    'LIMITED',
+    'NOT_VERIFIABLE'
+  ])
+  if (!name || !method || !reliability) return null
+  const rawValue =
+    typeof value.value === 'string' &&
+    /^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,4})?$/.test(value.value)
+      ? value.value
+      : null
+  const rawUnit = visionEnum(value.unit, ['MM', 'CM', 'M', 'IN'])
+  const mayExposeValue =
+    method !== 'UNSCALED_IMAGE' &&
+    reliability !== 'NOT_VERIFIABLE' &&
+    rawValue &&
+    rawUnit
+  return {
+    measurementId:
+      visionString(value.measurementId, 100) ||
+      `${name}:${method}:${reliability}`,
+    name,
+    method,
+    reliability,
+    value: mayExposeValue ? rawValue : null,
+    unit: mayExposeValue ? rawUnit : null
+  }
+}
+
+function normalizeVisionDifference(value) {
+  if (!isVisionRecord(value)) return null
+  const field = visionEnum(value.field, [
+    'VARIANT',
+    'SKU',
+    'DIMENSION',
+    'MATERIAL',
+    'COLOR',
+    'SHAPE',
+    'FINISH',
+    'COMPONENT',
+    'DESCRIPTION',
+    'OTHER'
+  ])
+  const assessment = visionEnum(value.assessment, [
+    'CONFIRMED',
+    'POSSIBLE',
+    'UNRESOLVED'
+  ])
+  const confidence = visionConfidence(value.confidence)
+  if (!field || !assessment || confidence === null) return null
+  return {
+    differenceId:
+      visionString(value.differenceId, 100) ||
+      `${field}:${assessment}`,
+    field,
+    assessment,
+    confidence,
+    expectedValue: visionString(
+      value.expectedValue,
+      2_000,
+      true
+    ),
+    observedValue: visionString(
+      value.observedValue,
+      2_000,
+      true
+    )
+  }
+}
+
+function normalizeVisionConformity(
+  value,
+  productRefs,
+  attachmentRefs
+) {
+  if (
+    !isVisionRecord(value) ||
+    value.contractVersion !== '1.0.0' ||
+    value.authority !== 'DERIVED'
+  ) {
+    return null
+  }
+  const productRef = visionRef(value.productRef)
+  const orderItemRef = visionRef(value.orderItemRef)
+  const verdict = visionEnum(value.verdict, [
+    'MATCH',
+    'DIFFERENCE_CONFIRMED',
+    'POSSIBLE_DIFFERENCE',
+    'NOT_VERIFIABLE'
+  ])
+  const confidence = visionConfidence(value.confidence)
+  if (
+    !productRef ||
+    !orderItemRef ||
+    !productRefs.has(productRef) ||
+    !verdict ||
+    confidence === null ||
+    !isVisionRecord(value.expected) ||
+    value.expected.authority !== 'SYSTEM_OF_RECORD' ||
+    !isVisionRecord(value.observed) ||
+    value.observed.authority !== 'DERIVED'
+  ) {
+    return null
+  }
+  const differences = Array.isArray(value.differences)
+    ? value.differences
+        .slice(0, 50)
+        .map(item => {
+          if (
+            !hasVisionSystemCitation(
+              item?.expectedCitations,
+              new Set([productRef, orderItemRef])
+            ) ||
+            !hasVisionAttachmentCitation(
+              item?.observedCitations,
+              attachmentRefs
+            )
+          ) {
+            return null
+          }
+          return normalizeVisionDifference(item)
+        })
+        .filter(Boolean)
+    : []
+  const blockingUnknowns = Array.isArray(value.blockingUnknowns)
+    ? value.blockingUnknowns
+        .slice(0, 20)
+        .map(item => visionString(item, 4_000))
+        .filter(Boolean)
+    : []
+  if (
+    (verdict === 'MATCH' && differences.length > 0) ||
+    (verdict === 'DIFFERENCE_CONFIRMED' &&
+      !differences.some(item => item.assessment === 'CONFIRMED')) ||
+    (verdict === 'NOT_VERIFIABLE' &&
+      blockingUnknowns.length === 0)
+  ) {
+    return null
+  }
+  if (
+    !hasVisionSystemCitation(
+      value.expected.citations,
+      new Set([productRef, orderItemRef])
+    )
+  ) {
+    return null
+  }
+  const referenceImageUrls = Array.isArray(
+    value.expected.referenceImageUrls
+  )
+    ? value.expected.referenceImageUrls
+        .slice(0, 3)
+        .map(url =>
+          visionHttpsUrl(url, { shopifyImage: true })
+        )
+        .filter(Boolean)
+    : []
+  const measurements = Array.isArray(value.observed.measurements)
+    ? value.observed.measurements
+        .slice(0, 20)
+        .map(item =>
+          normalizeVisionMeasurement(item, attachmentRefs)
+        )
+        .filter(Boolean)
+    : []
+  return {
+    productRef,
+    orderItemRef,
+    authority: 'DERIVED',
+    expected: {
+      authority: 'SYSTEM_OF_RECORD',
+      referenceBasis: visionEnum(
+        value.expected.referenceBasis,
+        [
+          'ORDER_LINE_ITEM',
+          'ORDER_TIME_PRODUCT_SNAPSHOT',
+          'CURRENT_PRODUCT_PAGE'
+        ],
+        'CURRENT_PRODUCT_PAGE'
+      ),
+      variantTitle: visionString(
+        value.expected.variantTitle,
+        1_000,
+        true
+      ),
+      sku: visionString(value.expected.sku, 300, true),
+      referenceImageUrls
+    },
+    observed: {
+      authority: 'DERIVED',
+      measurements
+    },
+    differences,
+    verdict,
+    confidence,
+    blockingUnknowns
+  }
+}
+
+function normalizeVisionAttachmentLinks(value, attachments) {
+  if (!Array.isArray(value)) return new Map()
+  const byRef = new Map(
+    attachments.map(item => [
+      item.descriptor.attachmentRef,
+      item
+    ])
+  )
+  const links = new Map()
+  value.slice(0, 100).forEach(item => {
+    if (!isVisionRecord(item)) return
+    const attachmentRef = visionRef(item.attachmentRef)
+    const attachment = byRef.get(attachmentRef)
+    if (!attachment || links.has(attachmentRef)) return
+    const canOpenAttachment =
+      attachment.freshLinkActions.includes('OPEN_ATTACHMENT')
+    const canOpenSource =
+      attachment.freshLinkActions.includes('OPEN_SOURCE')
+    const width =
+      Number.isInteger(item.width) &&
+      item.width >= 16 &&
+      item.width <= 10_000
+        ? item.width
+        : 640
+    const height =
+      Number.isInteger(item.height) &&
+      item.height >= 16 &&
+      item.height <= 10_000
+        ? item.height
+        : 480
+    links.set(attachmentRef, {
+      attachmentRef,
+      previewUrl:
+        canOpenAttachment &&
+        attachment.descriptor.mediaKind === 'IMAGE'
+          ? visionHttpsUrl(item.previewUrl, { allowSigned: true })
+          : null,
+      openAttachmentUrl: canOpenAttachment
+        ? visionHttpsUrl(item.openAttachmentUrl, {
+            allowSigned: true
+          })
+        : null,
+      openSourceUrl: canOpenSource
+        ? visionHttpsUrl(item.openSourceUrl, { allowSigned: true })
+        : null,
+      width,
+      height,
+      expiresAt: visionIsoDate(item.expiresAt)
+    })
+  })
+  return links
+}
+
+function filterVisionBundleForPermissions(
+  bundle,
+  canViewInternalAttachments
+) {
+  if (!bundle || canViewInternalAttachments) return bundle
+  const attachments = bundle.attachments.filter(
+    item => item.descriptor.visibility !== 'INTERNAL'
+  )
+  const pending = attachments.filter(item =>
+    VISION_PENDING_STATUSES.has(item.status)
+  ).length
+  const ready = attachments.filter(
+    item => item.status === 'READY'
+  ).length
+  const linkOnly = attachments.filter(
+    item => item.status === 'LINK_ONLY'
+  ).length
+  const unsupported = attachments.filter(
+    item => item.status === 'UNSUPPORTED'
+  ).length
+  const failed = attachments.filter(item =>
+    VISION_FAILED_STATUSES.has(item.status)
+  ).length
+  return {
+    ...bundle,
+    attachments,
+    omittedAttachmentCount: 0,
+    counts: {
+      total: attachments.length,
+      pending,
+      ready,
+      linkOnly,
+      unsupported,
+      failed
+    },
+    synthesis: null
+  }
+}
+
+function parseVisionUiPayload(value, expectations = {}) {
+  if (
+    isVisionRecord(value) &&
+    value[VISION_PARSED_PAYLOAD] === true
+  ) {
+    return (
+      (!expectations.payloadRef ||
+        value.payloadRef === expectations.payloadRef) &&
+      (!expectations.caseRef ||
+        value.caseRef === expectations.caseRef)
+    )
+      ? value
+      : null
+  }
+  if (
+    !isVisionRecord(value) ||
+    value.uiContractVersion !== VISION_UI_CONTRACT_VERSION ||
+    value.origin !== VISION_PAYLOAD_ORIGIN
+  ) {
+    return null
+  }
+  const payloadRef = visionRef(value.payloadRef)
+  const caseRef = visionRef(value.caseRef)
+  const generatedAt = visionIsoDate(value.generatedAt)
+  const canViewInternalAttachments =
+    isVisionRecord(value.permissions) &&
+    typeof value.permissions.canViewInternalAttachments === 'boolean'
+      ? value.permissions.canViewInternalAttachments
+      : null
+  if (
+    !payloadRef ||
+    !caseRef ||
+    !generatedAt ||
+    canViewInternalAttachments === null ||
+    (expectations.payloadRef &&
+      payloadRef !== expectations.payloadRef) ||
+    (expectations.caseRef && caseRef !== expectations.caseRef)
+  ) {
+    return null
+  }
+  const attachmentBundle = filterVisionBundleForPermissions(
+    normalizeVisionAttachmentBundle(
+      value.attachmentBundle,
+      caseRef
+    ),
+    canViewInternalAttachments
+  )
+  const productCards = Array.isArray(value.productCards)
+    ? value.productCards
+        .map(normalizeVisionProductCard)
+        .filter(Boolean)
+        .filter(
+          (card, index, cards) =>
+            cards.findIndex(
+              candidate =>
+                candidate.productRef === card.productRef &&
+                candidate.orderItemRef === card.orderItemRef
+            ) === index
+        )
+        .slice(0, VISION_PRODUCT_LIMIT)
+    : []
+  const productRefs = new Set(
+    productCards.map(card => card.productRef)
+  )
+  const attachmentRefs = new Set(
+    (attachmentBundle?.attachments || []).map(
+      item => item.descriptor.attachmentRef
+    )
+  )
+  const conformityComparisons = Array.isArray(
+    value.conformityComparisons
+  )
+    ? value.conformityComparisons
+        .map(item =>
+          normalizeVisionConformity(
+            item,
+            productRefs,
+            attachmentRefs
+          )
+        )
+        .filter(Boolean)
+        .slice(0, VISION_PRODUCT_LIMIT)
+    : []
+  const attachments = attachmentBundle?.attachments || []
+  const attachmentLinks = normalizeVisionAttachmentLinks(
+    value.attachmentLinks,
+    attachments
+  )
+  if (
+    !attachmentBundle &&
+    productCards.length === 0 &&
+    conformityComparisons.length === 0
+  ) {
+    return null
+  }
+  return {
+    [VISION_PARSED_PAYLOAD]: true,
+    uiContractVersion: VISION_UI_CONTRACT_VERSION,
+    origin: VISION_PAYLOAD_ORIGIN,
+    payloadRef,
+    caseRef,
+    generatedAt,
+    permissions: {
+      canViewInternalAttachments
+    },
+    attachmentBundle,
+    productCards,
+    conformityComparisons,
+    attachmentLinks
+  }
+}
+
+function parseVisionDirectiveAttrs(value) {
+  if (!isVisionRecord(value)) return null
+  if (
+    Object.prototype.hasOwnProperty.call(value, 'payload') ||
+    Object.prototype.hasOwnProperty.call(value, 'data') ||
+    Object.keys(value).some(
+      key => !['payloadRef', 'caseRef'].includes(key)
+    )
+  ) {
+    return null
+  }
+  const payloadRef = visionRef(value.payloadRef)
+  const caseRef = visionRef(value.caseRef)
+  return payloadRef && caseRef ? { payloadRef, caseRef } : null
+}
+
+function visionPayloadCacheKey(directive) {
+  if (!directive) return ''
+  return [
+    currentConnectionKey(),
+    currentProfileKey(),
+    directive.payloadRef,
+    directive.caseRef
+  ]
+    .map(value => encodeURIComponent(value))
+    .join(':')
+}
+
+function setBoundedVisionCache(cache, key, value, limit) {
+  if (!key) return
+  cache.delete(key)
+  cache.set(key, value)
+  while (cache.size > limit) {
+    const oldest = cache.keys().next().value
+    if (!oldest) break
+    cache.delete(oldest)
+  }
+}
+
+function cacheVisionPayload(directive, payload) {
+  const key = visionPayloadCacheKey(directive)
+  setBoundedVisionCache(
+    visionPayloadCache,
+    key,
+    { payload, cachedAt: Date.now() },
+    VISION_PAYLOAD_CACHE_LIMIT
+  )
+}
+
+function cachedVisionPayload(directive) {
+  const key = visionPayloadCacheKey(directive)
+  const cached = visionPayloadCache.get(key)
+  if (!cached) return null
+  if (Date.now() - cached.cachedAt >= VISION_PAYLOAD_CACHE_MS) {
+    visionPayloadCache.delete(key)
+    return null
+  }
+  visionPayloadCache.delete(key)
+  visionPayloadCache.set(key, cached)
+  return cached.payload
+}
+
+function visionAbortError() {
+  const error = new Error('VISION_REQUEST_ABORTED')
+  error.name = 'AbortError'
+  return error
+}
+
+function consumeVisionRequest(entry, signal, onNoConsumers) {
+  entry.consumers += 1
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const release = () => {
+      entry.consumers = Math.max(0, entry.consumers - 1)
+      if (entry.consumers === 0 && !entry.settled) {
+        onNoConsumers()
+      }
+    }
+    const finish = (callback, value) => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener?.('abort', abort)
+      release()
+      callback(value)
+    }
+    const abort = () => finish(reject, visionAbortError())
+    signal?.addEventListener?.('abort', abort, { once: true })
+    entry.promise.then(
+      value => finish(resolve, value),
+      error => finish(reject, error)
+    )
+    if (signal?.aborted) abort()
+  })
+}
+
+function createSharedVisionRequest(requests, key, loader) {
+  let entry = requests.get(key)
+  if (entry && !entry.controller.signal.aborted) return entry
+  if (entry) requests.delete(key)
+  const controller = new AbortController()
+  entry = {
+    controller,
+    consumers: 0,
+    settled: false,
+    promise: null
+  }
+  entry.promise = Promise.resolve()
+    .then(() => loader(controller.signal))
+    .finally(() => {
+      entry.settled = true
+      if (requests.get(key) === entry) requests.delete(key)
+    })
+  requests.set(key, entry)
+  return entry
+}
+
+function classifyVisionRequestError(error) {
+  if (error?.name === 'AbortError') return 'ABORTED'
+  const status = Number(
+    error?.status ||
+      error?.statusCode ||
+      error?.response?.status ||
+      error?.response?.statusCode
+  )
+  const code = [
+    error?.code,
+    error?.error,
+    error?.data?.error,
+    error?.body?.error,
+    error?.response?.data?.error,
+    error?.message
+  ]
+    .filter(Boolean)
+    .join(' ')
+  if (
+    status === 404 ||
+    status === 410 ||
+    /VISION_PAYLOAD_NOT_FOUND|NOT_FOUND|EXPIRED|404|410/i.test(code)
+  ) {
+    return 'EXPIRED'
+  }
+  return 'FAILED'
+}
+
+async function requestVisionPayload(
+  ctx,
+  directive,
+  { signal } = {}
+) {
+  const key = visionPayloadCacheKey(directive)
+  const entry = createSharedVisionRequest(
+    visionPayloadRequests,
+    key,
+    async requestSignal => {
+      const raw = await ctx.rest(
+        API_PATHS.visionPayload(
+          directive.payloadRef,
+          directive.caseRef
+        ),
+        {
+          timeoutMs: 15_000,
+          signal: requestSignal
+        }
+      )
+      if (isVisionRecord(raw) && typeof raw.error === 'string') {
+        const apiError = new Error('VISION_PAYLOAD_REQUEST_FAILED')
+        apiError.code = raw.error.slice(0, 100)
+        throw apiError
+      }
+      const payload = parseVisionUiPayload(raw, directive)
+      if (!payload) throw new Error('INVALID_VISION_PAYLOAD')
+      cacheVisionPayload(directive, payload)
+      return payload
+    }
+  )
+  return consumeVisionRequest(entry, signal, () => {
+    if (visionPayloadRequests.get(key) === entry) {
+      entry.controller.abort()
+    }
+  })
+}
+
+async function resolveVisionDirectivePayload(
+  ctx,
+  attrs,
+  structuredContent,
+  { force = false, signal } = {}
+) {
+  const directive = parseVisionDirectiveAttrs(attrs)
+  if (!directive) throw new Error('INVALID_VISION_DIRECTIVE')
+  const directPayload = parseVisionUiPayload(
+    structuredContent,
+    directive
+  )
+  if (directPayload) {
+    cacheVisionPayload(directive, directPayload)
+    return { payload: directPayload, source: 'STRUCTURED_CONTENT' }
+  }
+  const key = visionPayloadCacheKey(directive)
+  if (force) visionPayloadCache.delete(key)
+  const cached = force ? null : cachedVisionPayload(directive)
+  if (cached) return { payload: cached, source: 'MEMORY_CACHE' }
+  const payload = await requestVisionPayload(ctx, directive, {
+    signal
+  })
+  return { payload, source: 'AUTHENTICATED_HYDRATION' }
+}
+
+function visionAttachmentByRef(payload, attachmentRef) {
+  return (payload?.attachmentBundle?.attachments || []).find(
+    item => item.descriptor.attachmentRef === attachmentRef
+  )
+}
+
+function visionLinkCacheKey(payload, attachmentRef) {
+  return `${visionPayloadCacheKey(payload)}:${encodeURIComponent(
+    attachmentRef
+  )}`
+}
+
+function visionFreshLinkUrl(link, action, now = Date.now()) {
+  if (!link) return null
+  const expiresAt = link.expiresAt
+    ? Date.parse(link.expiresAt)
+    : null
+  if (
+    Number.isFinite(expiresAt) &&
+    expiresAt <= now + 5_000
+  ) {
+    return null
+  }
+  const candidate =
+    action === 'OPEN_SOURCE'
+      ? link.openSourceUrl
+      : link.openAttachmentUrl
+  if (
+    visionUrlHasSignedParameter(candidate) &&
+    !Number.isFinite(expiresAt)
+  ) {
+    return null
+  }
+  return visionHttpsUrl(candidate, { allowSigned: true })
+}
+
+function cachedVisionAttachmentLink(payload, attachmentRef, action) {
+  const key = visionLinkCacheKey(payload, attachmentRef)
+  const cached = visionAttachmentLinkCache.get(key)
+  if (!cached) return null
+  if (
+    Date.now() - cached.cachedAt >= VISION_LINK_CACHE_MS ||
+    !visionFreshLinkUrl(cached.link, action)
+  ) {
+    visionAttachmentLinkCache.delete(key)
+    return null
+  }
+  visionAttachmentLinkCache.delete(key)
+  visionAttachmentLinkCache.set(key, cached)
+  return cached.link
+}
+
+function cacheVisionAttachmentLinks(payload, links) {
+  links.forEach((link, attachmentRef) => {
+    setBoundedVisionCache(
+      visionAttachmentLinkCache,
+      visionLinkCacheKey(payload, attachmentRef),
+      { link, cachedAt: Date.now() },
+      VISION_LINK_CACHE_LIMIT
+    )
+    payload.attachmentLinks.set(attachmentRef, link)
+  })
+}
+
+async function requestVisionAttachmentLinks(
+  ctx,
+  payload,
+  attachmentRefs,
+  { action = 'OPEN_ATTACHMENT', signal } = {}
+) {
+  if (
+    !payload ||
+    !['OPEN_ATTACHMENT', 'OPEN_SOURCE'].includes(action)
+  ) {
+    throw new Error('INVALID_ATTACHMENT_LINK_REQUEST')
+  }
+  const refs = [...new Set(
+    (Array.isArray(attachmentRefs) ? attachmentRefs : [])
+      .map(visionRef)
+      .filter(reference => {
+        const attachment = visionAttachmentByRef(payload, reference)
+        return (
+          attachment &&
+          attachment.freshLinkActions.includes(action)
+        )
+      })
+  )].slice(0, 12)
+  if (refs.length === 0) {
+    throw new Error('INVALID_ATTACHMENT_LINK_REQUEST')
+  }
+  const cachedLinks = new Map()
+  const missingRefs = []
+  refs.forEach(reference => {
+    const inline = payload.attachmentLinks.get(reference)
+    if (visionFreshLinkUrl(inline, action)) {
+      cachedLinks.set(reference, inline)
+      return
+    }
+    const cached = cachedVisionAttachmentLink(
+      payload,
+      reference,
+      action
+    )
+    if (cached) cachedLinks.set(reference, cached)
+    else missingRefs.push(reference)
+  })
+  if (missingRefs.length === 0) return cachedLinks
+
+  const requestKey = `${visionPayloadCacheKey(payload)}:${action}:${
+    missingRefs.slice().sort().map(encodeURIComponent).join(',')
+  }`
+  const entry = createSharedVisionRequest(
+    visionAttachmentLinkRequests,
+    requestKey,
+    async requestSignal => {
+      const response = await ctx.rest(API_PATHS.attachmentLinks, {
+        method: 'POST',
+        body: {
+          payloadRef: payload.payloadRef,
+          caseRef: payload.caseRef,
+          attachmentRefs: missingRefs
+        },
+        timeoutMs: 15_000,
+        signal: requestSignal
+      })
+      if (
+        isVisionRecord(response) &&
+        typeof response.error === 'string'
+      ) {
+        const apiError = new Error('ATTACHMENT_LINK_REQUEST_FAILED')
+        apiError.code = response.error.slice(0, 100)
+        throw apiError
+      }
+      if (
+        !isVisionRecord(response) ||
+        visionRef(response.payloadRef) !== payload.payloadRef ||
+        visionRef(response.caseRef) !== payload.caseRef
+      ) {
+        throw new Error('INVALID_ATTACHMENT_LINK_RESPONSE')
+      }
+      const links = normalizeVisionAttachmentLinks(
+        response.attachmentLinks,
+        payload.attachmentBundle?.attachments || []
+      )
+      const hasEveryRequestedLink = missingRefs.every(reference =>
+        visionFreshLinkUrl(links.get(reference), action)
+      )
+      if (!hasEveryRequestedLink) {
+        throw new Error('ATTACHMENT_LINK_UNAVAILABLE')
+      }
+      cacheVisionAttachmentLinks(payload, links)
+      return links
+    }
+  )
+  const freshLinks = await consumeVisionRequest(
+    entry,
+    signal,
+    () => {
+      if (visionAttachmentLinkRequests.get(requestKey) === entry) {
+        entry.controller.abort()
+      }
+    }
+  )
+  return new Map([...cachedLinks, ...freshLinks])
+}
+
+async function openVisionAttachment(
+  ctx,
+  payload,
+  attachmentRef,
+  action,
+  { signal } = {}
+) {
+  const attachment = visionAttachmentByRef(payload, attachmentRef)
+  if (
+    !attachment ||
+    !attachment.freshLinkActions.includes(action)
+  ) {
+    throw new Error('ATTACHMENT_ACTION_NOT_ALLOWED')
+  }
+  let link = payload.attachmentLinks.get(attachmentRef)
+  let url = visionFreshLinkUrl(link, action)
+  if (!url) {
+    const links = await requestVisionAttachmentLinks(
+      ctx,
+      payload,
+      [attachmentRef],
+      { action, signal }
+    )
+    link = links.get(attachmentRef)
+    url = visionFreshLinkUrl(link, action)
+  }
+  if (!url) throw new Error('ATTACHMENT_LINK_UNAVAILABLE')
+  const opened = await ctx.os.openExternal(url)
+  if (opened === false) {
+    throw new Error('ATTACHMENT_LINK_OPEN_FAILED')
+  }
+  return true
+}
+
+function visibleVisionProducts(payload) {
+  return (payload?.productCards || []).filter(
+    card => card.displayMode !== 'HIDDEN'
+  )
+}
+
+function visionDisplayMode(payload) {
+  const products = visibleVisionProducts(payload)
+  if (products.some(card => card.displayMode === 'EXPLICIT')) {
+    return 'EXPLICIT'
+  }
+  return products.length > 0 ? 'AUTO_CONTEXT' : 'HIDDEN'
+}
+
+function visionDedupKey(sessionKey, payload) {
+  const refs = visibleVisionProducts(payload)
+    .map(card => card.productRef)
+    .sort()
+  if (!sessionKey || !payload?.caseRef || refs.length === 0) return ''
+  return [
+    visionString(sessionKey, 500),
+    payload.caseRef,
+    ...refs
+  ]
+    .map(value => encodeURIComponent(value))
+    .join(':')
+}
+
+function visionSurfaceAllowsProducts(surface) {
+  return [
+    'NOTIFICATION',
+    'BRIEF',
+    'SESSION',
+    'OVERVIEW',
+    'SEARCH'
+  ].includes(surface)
+}
+
+function currentVisionSessionKey(surface) {
+  const sessionId =
+    host.state.focusedSessionId.get() ||
+    host.state.activeSessionId.get()
+  return sessionId
+    ? `session:${sessionId}`
+    : `${surface.toLowerCase()}:${currentConnectionKey()}:${currentProfileKey()}`
+}
+
+function visionVisibilityStorageKey(sessionKey, caseRef) {
+  return `${VISION_HIDE_STORAGE_PREFIX}:${encodeURIComponent(
+    sessionKey
+  )}:${encodeURIComponent(caseRef || '')}`.slice(0, 900)
+}
+
+function useVisionProductVisibility(ctx, payload, surface) {
+  const sessionKey = currentVisionSessionKey(surface)
+  const storageKey = visionVisibilityStorageKey(
+    sessionKey,
+    payload?.caseRef
+  )
+  const [hidden, setHidden] = useState(() => {
+    try {
+      return ctx.storage.get(storageKey, false) === true
+    } catch {
+      return false
+    }
+  })
+  const [duplicate, setDuplicate] = useState(false)
+  const displayMode = visionDisplayMode(payload)
+  const dedupKey = visionDedupKey(sessionKey, payload)
+
+  useEffect(() => {
+    try {
+      setHidden(ctx.storage.get(storageKey, false) === true)
+    } catch {
+      setHidden(false)
+    }
+  }, [ctx, storageKey])
+
+  useEffect(() => {
+    setDuplicate(false)
+    if (displayMode !== 'AUTO_CONTEXT' || !dedupKey) {
+      return undefined
+    }
+    if (visionRenderedAutoContexts.has(dedupKey)) {
+      setDuplicate(true)
+      return undefined
+    }
+    visionRenderedAutoContexts.add(dedupKey)
+    if (visionRenderedAutoContexts.size > 500) {
+      const oldest = visionRenderedAutoContexts.values().next().value
+      if (oldest) visionRenderedAutoContexts.delete(oldest)
+    }
+    return undefined
+  }, [dedupKey, displayMode])
+
+  const toggleHidden = async () => {
+    const next = !hidden
+    setHidden(next)
+    try {
+      await ctx.storage.set(storageKey, next)
+    } catch {
+      // The in-memory choice still applies for the current render.
+    }
+  }
+
+  return {
+    duplicate,
+    hidden,
+    toggleHidden,
+    displayMode
+  }
+}
+
+const VISION_STYLE_RULES = `
+  .oblist-vision-focus:focus-visible {
+    outline: 2px solid var(--ui-accent);
+    outline-offset: 2px;
+  }
+  .oblist-vision-pressable {
+    transition: transform 120ms cubic-bezier(0.23, 1, 0.32, 1),
+      border-color 160ms ease;
+  }
+  .oblist-vision-pressable:active {
+    transform: scale(0.98);
+  }
+  .oblist-vision-carousel {
+    scrollbar-width: thin;
+    scrollbar-color: var(--ui-stroke-secondary) transparent;
+  }
+  .oblist-vision-carousel::-webkit-scrollbar {
+    height: 5px;
+  }
+  .oblist-vision-carousel::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: var(--ui-stroke-secondary);
+  }
+  @media (hover: hover) and (pointer: fine) {
+    .oblist-vision-pressable:hover {
+      border-color: var(--ui-accent);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .oblist-vision-pressable {
+      transition: border-color 120ms ease;
+    }
+    .oblist-vision-pressable:active {
+      transform: none;
+    }
+    .oblist-vision-carousel {
+      scroll-behavior: auto !important;
+    }
+  }
+`
+
+function VisionStyleRules() {
+  return jsx('style', { children: VISION_STYLE_RULES })
+}
+
+function VisionImage({
+  src,
+  alt,
+  width = 640,
+  height = 480,
+  square = false
+}) {
+  const [failed, setFailed] = useState(false)
+  const ratio = square ? '1 / 1' : `${width} / ${height}`
+  return jsx('div', {
+    style: {
+      width: '100%',
+      aspectRatio: ratio,
+      display: 'grid',
+      placeItems: 'center',
+      overflow: 'hidden',
+      borderRadius: '8px',
+      background: 'var(--ui-bg-primary)',
+      color: 'var(--ui-text-tertiary)'
+    },
+    children:
+      src && !failed
+        ? jsx('img', {
+            src,
+            alt,
+            width,
+            height,
+            loading: 'lazy',
+            decoding: 'async',
+            draggable: false,
+            onError: () => setFailed(true),
+            style: {
+              width: '100%',
+              height: '100%',
+              display: 'block',
+              objectFit: 'cover'
+            }
+          })
+        : jsxs('span', {
+            role: 'img',
+            'aria-label': alt || 'Image indisponible',
+            style: {
+              display: 'grid',
+              placeItems: 'center',
+              gap: '5px',
+              padding: '12px',
+              textAlign: 'center',
+              fontSize: '11px',
+              lineHeight: 1.35
+            },
+            children: [
+              jsx(Codicon, { name: 'file-media', size: '1.2rem' }),
+              jsx('span', { children: 'Aperçu indisponible' })
+            ]
+          })
+  })
+}
+
+function HorizontalVisionCarousel({ label, slides, renderSlide }) {
+  const reducedMotion = usePrefersReducedMotion()
+  const scrollerRef = useRef(null)
+  const [bounds, setBounds] = useState({
+    atStart: true,
+    atEnd: slides.length <= 1
+  })
+
+  const updateBounds = useCallback(() => {
+    const element = scrollerRef.current
+    if (!element) return
+    setBounds({
+      atStart: element.scrollLeft <= 2,
+      atEnd:
+        element.scrollLeft + element.clientWidth >=
+        element.scrollWidth - 2
+    })
+  }, [])
+
+  useEffect(() => {
+    const element = scrollerRef.current
+    if (!element) return undefined
+    const timer = window.setTimeout(updateBounds, 0)
+    element.addEventListener('scroll', updateBounds, {
+      passive: true
+    })
+    window.addEventListener('resize', updateBounds)
+    return () => {
+      window.clearTimeout(timer)
+      element.removeEventListener('scroll', updateBounds)
+      window.removeEventListener('resize', updateBounds)
+    }
+  }, [slides.length, updateBounds])
+
+  const move = (direction, keyboard = false) => {
+    const element = scrollerRef.current
+    if (!element) return
+    element.scrollBy({
+      left:
+        direction *
+        Math.max(156, Math.round(element.clientWidth * 0.76)),
+      behavior: keyboard || reducedMotion ? 'auto' : 'auto'
+    })
+  }
+
+  const jump = edge => {
+    const element = scrollerRef.current
+    if (!element) return
+    element.scrollTo({
+      left: edge === 'start' ? 0 : element.scrollWidth,
+      behavior: 'auto'
+    })
+  }
+
+  const onKeyDown = event => {
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault()
+      move(-1, true)
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault()
+      move(1, true)
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      jump('start')
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      jump('end')
+    }
+  }
+
+  if (slides.length === 0) return null
+  return jsxs('section', {
+    'aria-label': label,
+    style: {
+      display: 'grid',
+      gap: '7px',
+      minWidth: 0
+    },
+    children: [
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '8px'
+        },
+        children: [
+          jsxs('span', {
+            style: {
+              color: 'var(--ui-text-secondary)',
+              fontSize: '11px',
+              fontWeight: 700
+            },
+            children: [
+              label,
+              jsx('span', {
+                style: {
+                  marginLeft: '6px',
+                  color: 'var(--ui-text-tertiary)',
+                  fontWeight: 500
+                },
+                children: `${slides.length} élément${
+                  slides.length > 1 ? 's' : ''
+                }`
+              })
+            ]
+          }),
+          slides.length > 1
+            ? jsxs('div', {
+                style: {
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '4px'
+                },
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className:
+                      'oblist-vision-focus oblist-vision-pressable',
+                    disabled: bounds.atStart,
+                    'aria-label': `Élément précédent — ${label}`,
+                    onClick: () => move(-1),
+                    style: {
+                      width: '28px',
+                      height: '28px',
+                      display: 'grid',
+                      placeItems: 'center',
+                      border: '1px solid var(--ui-stroke-secondary)',
+                      borderRadius: '7px',
+                      background: 'var(--ui-bg-primary)',
+                      color: 'var(--ui-text-primary)',
+                      cursor: bounds.atStart ? 'default' : 'pointer',
+                      opacity: bounds.atStart ? 0.45 : 1
+                    },
+                    children: jsx(Codicon, {
+                      name: 'chevron-left',
+                      size: '0.85rem'
+                    })
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className:
+                      'oblist-vision-focus oblist-vision-pressable',
+                    disabled: bounds.atEnd,
+                    'aria-label': `Élément suivant — ${label}`,
+                    onClick: () => move(1),
+                    style: {
+                      width: '28px',
+                      height: '28px',
+                      display: 'grid',
+                      placeItems: 'center',
+                      border: '1px solid var(--ui-stroke-secondary)',
+                      borderRadius: '7px',
+                      background: 'var(--ui-bg-primary)',
+                      color: 'var(--ui-text-primary)',
+                      cursor: bounds.atEnd ? 'default' : 'pointer',
+                      opacity: bounds.atEnd ? 0.45 : 1
+                    },
+                    children: jsx(Codicon, {
+                      name: 'chevron-right',
+                      size: '0.85rem'
+                    })
+                  })
+                ]
+              })
+            : null
+        ]
+      }),
+      jsx('div', {
+        ref: scrollerRef,
+        className: 'oblist-vision-carousel oblist-vision-focus',
+        role: 'region',
+        'aria-roledescription': 'carrousel',
+        'aria-label': `${label}. Utilisez les flèches gauche et droite, ou faites défiler horizontalement.`,
+        tabIndex: 0,
+        onKeyDown,
+        style: {
+          display: 'grid',
+          gridAutoFlow: 'column',
+          gridAutoColumns: 'clamp(148px, 29%, 206px)',
+          gap: '9px',
+          minWidth: 0,
+          overflowX: 'auto',
+          overflowY: 'hidden',
+          overscrollBehaviorX: 'contain',
+          scrollSnapType: 'x mandatory',
+          scrollPaddingInline: '1px',
+          padding: '1px 1px 5px',
+          touchAction: 'pan-x pan-y'
+        },
+        children: slides.map((slide, index) =>
+          renderSlide(slide, index)
+        )
+      })
+    ]
+  })
+}
+
+function openVisionUrl(ctx, value) {
+  const url = visionHttpsUrl(value, { allowSigned: true })
+  if (url) void ctx.os.openExternal(url)
+}
+
+function visionSourceLabel(source) {
+  return {
+    INTERCOM_CONVERSATION: 'Intercom',
+    INTERCOM_SIDE_CONVERSATION: 'Conversation vendeur Intercom',
+    RETURN_PORTAL: 'Portail de retour',
+    INFO_REQUEST: 'Info Request'
+  }[source] || 'Source vérifiée'
+}
+
+function visionAuthorLabel(author) {
+  if (author?.displayName) return author.displayName
+  return {
+    CUSTOMER: 'Client',
+    VENDOR: 'Vendeur',
+    ADMIN: 'Service client',
+    BOT: 'Automatisation',
+    SYSTEM: 'Système',
+    UNVERIFIED_EXTERNAL: 'Partie externe non vérifiée'
+  }[author?.role] || 'Auteur inconnu'
+}
+
+function visionStatusLabel(status) {
+  if (VISION_PENDING_STATUSES.has(status)) return 'Analyse en cours'
+  if (status === 'READY') return 'Analysé · DERIVED'
+  if (status === 'LINK_ONLY') return 'LINK_ONLY · non analysé'
+  if (status === 'UNSUPPORTED') return 'Format non analysé'
+  if (status === 'TIMED_OUT') return 'Analyse expirée'
+  if (status === 'DLQ') return 'Analyse à reprendre'
+  if (status === 'FAILED') return 'Analyse impossible'
+  return 'Statut indisponible'
+}
+
+function visionAttachmentSummary(item) {
+  if (item.descriptor.mediaKind === 'VIDEO') {
+    return 'Vidéo reçue — non analysée.'
+  }
+  if (item.status === 'READY' && item.insight) {
+    return item.insight.summary
+  }
+  if (VISION_PENDING_STATUSES.has(item.status)) {
+    return 'Le fichier est disponible ; son analyse est en cours.'
+  }
+  if (item.status === 'UNSUPPORTED') {
+    return 'Ce format reste accessible, mais aucune analyse n’est affirmée.'
+  }
+  if (VISION_FAILED_STATUSES.has(item.status)) {
+    return 'L’analyse n’a pas abouti. Le fichier source reste à vérifier.'
+  }
+  return 'Fichier disponible pour vérification humaine.'
+}
+
+function visionAttachmentActionLabel(mediaKind) {
+  if (mediaKind === 'IMAGE') return 'Voir l’image'
+  if (mediaKind === 'VIDEO') return 'Voir la vidéo'
+  if (mediaKind === 'AUDIO') return 'Écouter le fichier'
+  return 'Voir le document'
+}
+
+function buildVisionEvidenceSlides(payload) {
+  if (!payload) return []
+  const products = new Map(
+    visibleVisionProducts(payload).map(product => [
+      product.productRef,
+      product
+    ])
+  )
+  const attachments =
+    payload.attachmentBundle?.attachments || []
+  const evidenceMode =
+    payload.conformityComparisons.length > 0 ||
+    attachments.some(item =>
+      ['DAMAGE_EVIDENCE', 'PRODUCT_CONFORMITY'].includes(
+        item.insight?.purpose
+      )
+    )
+  if (!evidenceMode) return []
+
+  const expectedSlides = []
+  const expectedUrls = new Set()
+  const comparisons =
+    payload.conformityComparisons.length > 0
+      ? payload.conformityComparisons
+      : [...products.values()].map(product => ({
+          productRef: product.productRef,
+          expected: {
+            referenceBasis: 'CURRENT_PRODUCT_PAGE',
+            referenceImageUrls: product.imageUrl
+              ? [product.imageUrl]
+              : []
+          }
+        }))
+  comparisons.forEach(comparison => {
+    const product = products.get(comparison.productRef)
+    if (!product) return
+    const urls =
+      comparison.expected.referenceImageUrls.length > 0
+        ? comparison.expected.referenceImageUrls
+        : product.imageUrl
+          ? [product.imageUrl]
+          : []
+    urls.slice(0, 3).forEach((url, index) => {
+      if (expectedUrls.has(url)) return
+      expectedUrls.add(url)
+      expectedSlides.push({
+        id: `expected:${product.productRef}:${index}`,
+        kind: 'EXPECTED',
+        label: 'Produit attendu',
+        title: product.title,
+        meta:
+          comparison.expected.referenceBasis ===
+          'ORDER_TIME_PRODUCT_SNAPSHOT'
+            ? 'Référence au moment de la commande'
+            : comparison.expected.referenceBasis === 'ORDER_LINE_ITEM'
+              ? 'Variante commandée'
+              : 'Fiche produit actuelle',
+        imageUrl: url,
+        openUrl: product.productUrl,
+        imageAlt: product.imageAlt,
+        width: 640,
+        height: 640,
+        attachmentRef: null,
+        observations: []
+      })
+    })
+  })
+
+  const receivedSlides = attachments.flatMap(item => {
+    if (
+      !['IMAGE', 'VIDEO'].includes(item.descriptor.mediaKind)
+    ) {
+      return []
+    }
+    const links = payload.attachmentLinks.get(
+      item.descriptor.attachmentRef
+    )
+    const freshAttachmentUrl = visionFreshLinkUrl(
+      links,
+      'OPEN_ATTACHMENT'
+    )
+    const observations = [
+      ...(item.insight?.damages || []),
+      ...(item.insight?.visualObservations || [])
+    ]
+      .map(observation => observation.text)
+      .filter(Boolean)
+      .slice(0, 2)
+    return [{
+      id: `received:${item.descriptor.attachmentRef}`,
+      kind:
+        item.descriptor.mediaKind === 'VIDEO'
+          ? 'VIDEO'
+          : 'RECEIVED',
+      label:
+        item.descriptor.mediaKind === 'VIDEO'
+          ? 'Vidéo reçue'
+          : 'Photo reçue',
+      title: item.descriptor.fileName,
+      meta: `${visionSourceLabel(
+        item.descriptor.source
+      )} · ${visionAuthorLabel(
+        item.descriptor.author
+      )} · ${parisDateTime(item.descriptor.occurredAt) || 'Date inconnue'}`,
+      imageUrl:
+        item.descriptor.mediaKind === 'IMAGE' &&
+        freshAttachmentUrl
+          ? links?.previewUrl || null
+          : null,
+      openUrl: freshAttachmentUrl,
+      attachmentRef: item.descriptor.attachmentRef,
+      imageAlt:
+        item.descriptor.mediaKind === 'VIDEO'
+          ? 'Vidéo reçue — non analysée'
+          : `Preuve reçue — ${item.descriptor.fileName}`,
+      width: links?.width || 640,
+      height: links?.height || 480,
+      observations
+    }]
+  })
+
+  const expectedLimit = Math.min(3, expectedSlides.length)
+  return [
+    ...expectedSlides.slice(0, expectedLimit),
+    ...receivedSlides.slice(0, VISION_PRODUCT_LIMIT - expectedLimit)
+  ].slice(0, VISION_PRODUCT_LIMIT)
+}
+
+function VisionProductSlide({ ctx, card }) {
+  const interactive = Boolean(card.productUrl)
+  const element = interactive ? 'button' : 'article'
+  return jsx(element, {
+    ...(interactive
+      ? {
+          type: 'button',
+          onClick: () => openVisionUrl(ctx, card.productUrl),
+          'aria-label': `Voir le produit ${card.title}`
+        }
+      : {}),
+    className: interactive
+      ? 'oblist-vision-focus oblist-vision-pressable'
+      : undefined,
+    style: {
+      width: '100%',
+      minWidth: 0,
+      display: 'grid',
+      alignContent: 'start',
+      gap: '7px',
+      scrollSnapAlign: 'start',
+      padding: '8px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '10px',
+      background: 'var(--ui-bg-secondary)',
+      color: 'var(--ui-text-primary)',
+      cursor: interactive ? 'pointer' : 'default',
+      font: 'inherit',
+      textAlign: 'left'
+    },
+    children: jsxs('div', {
+      style: { display: 'grid', gap: '7px', minWidth: 0 },
+      children: [
+        jsx(VisionImage, {
+          src: card.imageUrl,
+          alt: card.imageAlt,
+          width: 640,
+          height: 640,
+          square: true
+        }),
+        jsx('strong', {
+          style: {
+            minHeight: '2.7em',
+            display: '-webkit-box',
+            overflow: 'hidden',
+            WebkitBoxOrient: 'vertical',
+            WebkitLineClamp: 2,
+            fontSize: '12px',
+            lineHeight: 1.35
+          },
+          children: card.title
+        }),
+        jsx('span', {
+          style: {
+            overflow: 'hidden',
+            color: 'var(--ui-text-tertiary)',
+            fontSize: '10px',
+            lineHeight: 1.35,
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap'
+          },
+          children: [
+            card.vendorName,
+            card.variantTitle ? ` · ${card.variantTitle}` : '',
+            card.quantity > 1 ? ` · ×${card.quantity}` : ''
+          ].join('')
+        }),
+        interactive
+          ? jsx('span', {
+              style: {
+                color: 'var(--ui-accent)',
+                fontSize: '11px',
+                fontWeight: 700
+              },
+              children: 'Voir le produit →'
+            })
+          : jsx('span', {
+              style: {
+                color: 'var(--ui-text-tertiary)',
+                fontSize: '10px'
+              },
+              children: 'Lien produit indisponible'
+            })
+      ]
+    })
+  })
+}
+
+function useVisionAttachmentOpener(ctx, payload, attachmentRef) {
+  const controllerRef = useRef(null)
+  const mountedRef = useRef(true)
+  const [working, setWorking] = useState('')
+  const [error, setError] = useState(false)
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      controllerRef.current?.abort()
+    }
+  }, [])
+
+  const open = async action => {
+    controllerRef.current?.abort()
+    const controller = new AbortController()
+    controllerRef.current = controller
+    setWorking(action)
+    setError(false)
+    try {
+      await openVisionAttachment(
+        ctx,
+        payload,
+        attachmentRef,
+        action,
+        { signal: controller.signal }
+      )
+      return true
+    } catch (openError) {
+      if (
+        mountedRef.current &&
+        classifyVisionRequestError(openError) !== 'ABORTED'
+      ) {
+        setError(true)
+      }
+      return false
+    } finally {
+      if (controllerRef.current === controller) {
+        controllerRef.current = null
+        if (mountedRef.current) setWorking('')
+      }
+    }
+  }
+
+  return { error, open, working }
+}
+
+function VisionEvidenceSlide({ ctx, payload, slide }) {
+  const opener = useVisionAttachmentOpener(
+    ctx,
+    payload,
+    slide.attachmentRef
+  )
+  const interactive = Boolean(
+    slide.openUrl || slide.attachmentRef
+  )
+  const element = interactive ? 'button' : 'article'
+  return jsx(element, {
+    ...(interactive
+      ? {
+          type: 'button',
+          onClick: () =>
+            slide.attachmentRef
+              ? void opener.open('OPEN_ATTACHMENT')
+              : openVisionUrl(ctx, slide.openUrl),
+          disabled: Boolean(opener.working),
+          'aria-busy': Boolean(opener.working),
+          'aria-label': `${slide.label} — ${slide.title}`
+        }
+      : {}),
+    className: interactive
+      ? 'oblist-vision-focus oblist-vision-pressable'
+      : undefined,
+    style: {
+      width: '100%',
+      minWidth: 0,
+      display: 'grid',
+      alignContent: 'start',
+      gap: '7px',
+      scrollSnapAlign: 'start',
+      padding: '8px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '10px',
+      background: 'var(--ui-bg-secondary)',
+      color: 'var(--ui-text-primary)',
+      cursor: interactive ? 'pointer' : 'default',
+      font: 'inherit',
+      textAlign: 'left'
+    },
+    children: [
+      jsx('span', {
+        style: {
+          color:
+            slide.kind === 'EXPECTED'
+              ? 'var(--ui-accent)'
+              : 'var(--ui-text-secondary)',
+          fontSize: '10px',
+          fontWeight: 750,
+          letterSpacing: '0.06em',
+          textTransform: 'uppercase'
+        },
+        children:
+          slide.kind === 'VIDEO'
+            ? 'Vidéo reçue · non analysée'
+            : slide.label
+      }),
+      jsx(VisionImage, {
+        src: slide.imageUrl,
+        alt: slide.imageAlt,
+        width: slide.width,
+        height: slide.height,
+        square: slide.kind === 'EXPECTED'
+      }),
+      jsx('strong', {
+        style: {
+          display: '-webkit-box',
+          overflow: 'hidden',
+          WebkitBoxOrient: 'vertical',
+          WebkitLineClamp: 2,
+          fontSize: '11px',
+          lineHeight: 1.35
+        },
+        children: slide.title
+      }),
+      jsx('span', {
+        style: {
+          display: '-webkit-box',
+          overflow: 'hidden',
+          color: 'var(--ui-text-tertiary)',
+          fontSize: '10px',
+          lineHeight: 1.35,
+          WebkitBoxOrient: 'vertical',
+          WebkitLineClamp: 2
+        },
+        children: slide.meta
+      }),
+      ...slide.observations.slice(0, 1).map(observation =>
+        jsx('span', {
+          key: observation,
+          style: {
+            display: '-webkit-box',
+            overflow: 'hidden',
+            color: 'var(--ui-text-secondary)',
+            fontSize: '10px',
+            lineHeight: 1.35,
+            WebkitBoxOrient: 'vertical',
+            WebkitLineClamp: 2
+          },
+          children: `Observation liée : ${observation}`
+        })
+      ),
+      interactive
+        ? jsx('span', {
+            style: {
+              color: 'var(--ui-accent)',
+              fontSize: '11px',
+              fontWeight: 700
+            },
+            children:
+              opener.working
+                ? 'Ouverture…'
+                : opener.error
+                  ? 'Réessayer l’ouverture'
+                  : slide.kind === 'EXPECTED'
+                ? 'Voir le produit →'
+                : slide.kind === 'VIDEO'
+                  ? 'Voir la vidéo →'
+                  : 'Voir l’original →'
+          })
+        : null
+    ]
+  })
+}
+
+function VisionAttachmentAction({
+  ctx,
+  payload,
+  item,
+  action,
+  label
+}) {
+  const opener = useVisionAttachmentOpener(
+    ctx,
+    payload,
+    item.descriptor.attachmentRef
+  )
+  if (!item.freshLinkActions.includes(action)) return null
+  return jsx(Button, {
+    size: 'sm',
+    variant: 'secondary',
+    disabled: Boolean(opener.working),
+    'aria-busy': Boolean(opener.working),
+    onClick: () => void opener.open(action),
+    children: opener.working
+      ? 'Ouverture…'
+      : opener.error
+        ? `Réessayer — ${label}`
+        : label
+  })
+}
+
+function VisionAttachmentsBlock({ ctx, payload }) {
+  const bundle = payload.attachmentBundle
+  if (!bundle || bundle.counts.total === 0) return null
+  const visible = bundle.attachments.slice(
+    0,
+    VISION_ATTACHMENT_VISIBLE_LIMIT
+  )
+  const hiddenCount =
+    Math.max(0, bundle.attachments.length - visible.length) +
+    bundle.omittedAttachmentCount
+  return jsxs('section', {
+    'aria-label': 'Pièces jointes',
+    style: {
+      display: 'grid',
+      gap: '8px',
+      padding: '10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '10px',
+      background: 'var(--ui-bg-primary)'
+    },
+    children: [
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '8px',
+          flexWrap: 'wrap'
+        },
+        children: [
+          jsx('strong', {
+            style: { fontSize: '12px' },
+            children: 'Pièces jointes'
+          }),
+          jsx('span', {
+            style: {
+              color: 'var(--ui-text-tertiary)',
+              fontSize: '10px'
+            },
+            children: `${bundle.counts.total} fichier${
+              bundle.counts.total > 1 ? 's' : ''
+            } · ${bundle.counts.ready} analysé${
+              bundle.counts.ready > 1 ? 's' : ''
+            } · ${bundle.counts.pending} en cours`
+          })
+        ]
+      }),
+      bundle.synthesis
+        ? jsxs('div', {
+            style: {
+              display: 'grid',
+              gap: '3px',
+              padding: '8px',
+              borderRadius: '8px',
+              background: 'var(--ui-bg-secondary)'
+            },
+            children: [
+              jsx('span', {
+                style: {
+                  color: 'var(--ui-text-tertiary)',
+                  fontSize: '10px',
+                  fontWeight: 750
+                },
+                children: 'SYNTHÈSE DERIVED'
+              }),
+              jsx('span', {
+                style: {
+                  color: 'var(--ui-text-secondary)',
+                  fontSize: '11px',
+                  lineHeight: 1.4
+                },
+                children: bundle.synthesis.summary
+              })
+            ]
+          })
+        : null,
+      ...visible.map(item => {
+        const descriptor = item.descriptor
+        const internal = descriptor.visibility === 'INTERNAL'
+        return jsxs('article', {
+          key: descriptor.attachmentRef,
+          style: {
+            display: 'grid',
+            gap: '5px',
+            padding: '8px 0',
+            borderTop: '1px solid var(--ui-stroke-secondary)'
+          },
+          children: [
+            jsxs('div', {
+              style: {
+                display: 'flex',
+                alignItems: 'flex-start',
+                justifyContent: 'space-between',
+                gap: '8px',
+                flexWrap: 'wrap'
+              },
+              children: [
+                jsxs('div', {
+                  style: { display: 'grid', gap: '2px', minWidth: 0 },
+                  children: [
+                    jsx('strong', {
+                      style: {
+                        overflow: 'hidden',
+                        fontSize: '11px',
+                        lineHeight: 1.35,
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap'
+                      },
+                      children: descriptor.fileName
+                    }),
+                    jsx('span', {
+                      style: {
+                        color: 'var(--ui-text-tertiary)',
+                        fontSize: '10px',
+                        lineHeight: 1.35
+                      },
+                      children: `${visionSourceLabel(
+                        descriptor.source
+                      )} · ${visionAuthorLabel(
+                        descriptor.author
+                      )} · ${
+                        parisDateTime(descriptor.occurredAt) ||
+                        'Date inconnue'
+                      }`
+                    })
+                  ]
+                }),
+                jsx(Badge, {
+                  children: visionStatusLabel(item.status)
+                })
+              ]
+            }),
+            jsx('span', {
+              style: {
+                color: 'var(--ui-text-secondary)',
+                fontSize: '11px',
+                lineHeight: 1.4
+              },
+              children: visionAttachmentSummary(item)
+            }),
+            internal
+              ? jsx('span', {
+                  style: {
+                    color: 'var(--ui-text-tertiary)',
+                    fontSize: '10px',
+                    fontWeight: 650
+                  },
+                  children:
+                    'Note interne · non copiée dans les messages externes'
+                })
+              : null,
+            jsxs('div', {
+              style: rowStyle,
+              children: [
+                jsx(VisionAttachmentAction, {
+                  ctx,
+                  payload,
+                  item,
+                  action: 'OPEN_ATTACHMENT',
+                  label: visionAttachmentActionLabel(
+                    descriptor.mediaKind
+                  )
+                }),
+                jsx(VisionAttachmentAction, {
+                  ctx,
+                  payload,
+                  item,
+                  action: 'OPEN_SOURCE',
+                  label: 'Voir la source'
+                })
+              ]
+            })
+          ]
+        })
+      }),
+      hiddenCount > 0
+        ? jsx('span', {
+            style: {
+              color: 'var(--ui-text-tertiary)',
+              fontSize: '10px'
+            },
+            children: `+ ${hiddenCount} autre${
+              hiddenCount > 1 ? 's' : ''
+            } pièce${hiddenCount > 1 ? 's' : ''} dans le dossier`
+          })
+        : null
+    ]
+  })
+}
+
+function visionVerdictLabel(verdict) {
+  return {
+    MATCH: 'Conforme aux preuves disponibles',
+    DIFFERENCE_CONFIRMED: 'Différence confirmée',
+    POSSIBLE_DIFFERENCE: 'Différence possible',
+    NOT_VERIFIABLE: 'Non vérifiable'
+  }[verdict] || 'À vérifier'
+}
+
+function visionDifferenceFieldLabel(field) {
+  return {
+    VARIANT: 'Variante',
+    SKU: 'Référence',
+    DIMENSION: 'Dimensions',
+    MATERIAL: 'Matériau',
+    COLOR: 'Couleur',
+    SHAPE: 'Forme',
+    FINISH: 'Finition',
+    COMPONENT: 'Composant',
+    DESCRIPTION: 'Description',
+    OTHER: 'Autre'
+  }[field] || 'Écart'
+}
+
+function VisionConformityBlock({ payload }) {
+  if (payload.conformityComparisons.length === 0) return null
+  return jsxs('section', {
+    'aria-label': 'Conformité produit',
+    style: {
+      display: 'grid',
+      gap: '8px',
+      padding: '10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '10px',
+      background: 'var(--ui-bg-primary)'
+    },
+    children: [
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '8px',
+          flexWrap: 'wrap'
+        },
+        children: [
+          jsx('strong', {
+            style: { fontSize: '12px' },
+            children: 'Conformité produit'
+          }),
+          jsx('span', {
+            style: {
+              color: 'var(--ui-text-tertiary)',
+              fontSize: '10px',
+              fontWeight: 700
+            },
+            children: 'DERIVED · à confirmer par le CS'
+          })
+        ]
+      }),
+      ...payload.conformityComparisons.slice(0, 2).map(comparison => {
+        const product = payload.productCards.find(
+          card => card.productRef === comparison.productRef
+        )
+        return jsxs('article', {
+          key: `${comparison.productRef}:${comparison.orderItemRef}`,
+          style: {
+            display: 'grid',
+            gap: '6px',
+            padding: '8px',
+            borderRadius: '8px',
+            background: 'var(--ui-bg-secondary)'
+          },
+          children: [
+            jsxs('div', {
+              style: {
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: '8px',
+                flexWrap: 'wrap'
+              },
+              children: [
+                jsx('strong', {
+                  style: { fontSize: '11px' },
+                  children:
+                    product?.title || 'Produit du dossier'
+                }),
+                jsx(Badge, {
+                  children: visionVerdictLabel(comparison.verdict)
+                })
+              ]
+            }),
+            ...comparison.differences.slice(0, 3).map(difference =>
+              jsxs('div', {
+                key: difference.differenceId,
+                style: {
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(70px, 0.4fr) 1fr',
+                  gap: '5px 8px',
+                  fontSize: '10px',
+                  lineHeight: 1.4
+                },
+                children: [
+                  jsx('strong', {
+                    children: visionDifferenceFieldLabel(
+                      difference.field
+                    )
+                  }),
+                  jsx('span', {
+                    style: { color: 'var(--ui-text-secondary)' },
+                    children: `${
+                      difference.expectedValue ||
+                      'Valeur attendue non précisée'
+                    } → ${
+                      difference.observedValue ||
+                      'Observation non concluante'
+                    } · ${
+                      difference.assessment === 'CONFIRMED'
+                        ? 'confirmé'
+                        : difference.assessment === 'POSSIBLE'
+                          ? 'possible'
+                          : 'non résolu'
+                    }`
+                  })
+                ]
+              })
+            ),
+            ...comparison.observed.measurements
+              .slice(0, 3)
+              .map(measurement =>
+                jsx('span', {
+                  key: measurement.measurementId,
+                  style: {
+                    color: 'var(--ui-text-secondary)',
+                    fontSize: '10px',
+                    lineHeight: 1.4
+                  },
+                  children: measurement.value
+                    ? `${measurement.name} : ${measurement.value} ${measurement.unit} · preuve explicite`
+                    : `${measurement.name} : non vérifiable sans échelle fiable`
+                })
+              ),
+            comparison.blockingUnknowns.length > 0
+              ? jsx('span', {
+                  role: 'status',
+                  style: {
+                    color: 'var(--ui-text-secondary)',
+                    fontSize: '10px',
+                    lineHeight: 1.4
+                  },
+                  children: `À vérifier : ${comparison.blockingUnknowns
+                    .slice(0, 2)
+                    .join(' · ')}`
+                })
+              : null
+          ]
+        })
+      }),
+      payload.conformityComparisons.length > 2
+        ? jsx('span', {
+            style: {
+              color: 'var(--ui-text-tertiary)',
+              fontSize: '10px'
+            },
+            children: `+ ${
+              payload.conformityComparisons.length - 2
+            } autre${
+              payload.conformityComparisons.length - 2 > 1
+                ? 's'
+                : ''
+            } comparaison${
+              payload.conformityComparisons.length - 2 > 1
+                ? 's'
+                : ''
+            }`
+          })
+        : null
+    ]
+  })
+}
+
+function VisionProductsControl({
+  hidden,
+  onToggle,
+  hasProducts
+}) {
+  if (!hasProducts) return null
+  return jsx('button', {
+    type: 'button',
+    className: 'oblist-vision-focus oblist-vision-pressable',
+    onClick: () => void onToggle(),
+    style: {
+      border: 0,
+      padding: '3px 0',
+      background: 'transparent',
+      color: 'var(--ui-accent)',
+      cursor: 'pointer',
+      font: 'inherit',
+      fontSize: '10px',
+      fontWeight: 700
+    },
+    children: hidden ? 'Afficher les produits' : 'Masquer les produits'
+  })
+}
+
+function VisionContextBlock({
+  ctx,
+  value,
+  surface = 'SESSION',
+  expectations = {}
+}) {
+  const payload = useMemo(
+    () => parseVisionUiPayload(value, expectations),
+    [expectations.caseRef, expectations.payloadRef, value]
+  )
+  const visibility = useVisionProductVisibility(
+    ctx,
+    payload,
+    surface
+  )
+  if (surface === 'ACTION_CARD') return null
+  if (!payload) {
+    return value
+      ? jsx('div', {
+          role: 'alert',
+          style: {
+            padding: '9px 10px',
+            border: '1px solid var(--ui-stroke-secondary)',
+            borderRadius: '9px',
+            color: 'var(--ui-text-secondary)',
+            fontSize: '11px'
+          },
+          children:
+            'Le contexte visuel reçu est invalide ou ne correspond pas à ce dossier.'
+        })
+      : null
+  }
+  const products = visibleVisionProducts(payload)
+  const canRenderProducts =
+    visionSurfaceAllowsProducts(surface) &&
+    products.length > 0 &&
+    !visibility.duplicate
+  const showProducts = canRenderProducts && !visibility.hidden
+  const allEvidenceSlides = buildVisionEvidenceSlides(payload)
+  const evidenceSlides = showProducts
+    ? allEvidenceSlides
+    : allEvidenceSlides.filter(slide => slide.kind !== 'EXPECTED')
+  const showEvidence = evidenceSlides.length > 0
+
+  return jsxs('section', {
+    'aria-label': 'Contexte visuel vérifié du dossier',
+    style: {
+      width: 'min(760px, 100%)',
+      minWidth: 0,
+      display: 'grid',
+      gap: '9px',
+      padding: '10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '11px',
+      background: 'var(--ui-bg-secondary)',
+      color: 'var(--ui-text-primary)',
+      overflow: 'hidden'
+    },
+    children: [
+      jsx(VisionStyleRules, {}),
+      jsxs('div', {
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: '8px',
+          flexWrap: 'wrap'
+        },
+        children: [
+          jsxs('div', {
+            style: {
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px'
+            },
+            children: [
+              jsx(Codicon, { name: 'eye', size: '0.85rem' }),
+              jsx('strong', {
+                style: { fontSize: '12px' },
+                children: 'Contexte visuel'
+              })
+            ]
+          }),
+          canRenderProducts
+            ? jsx(VisionProductsControl, {
+                hidden: visibility.hidden,
+                onToggle: visibility.toggleHidden,
+                hasProducts: true
+              })
+            : null
+        ]
+      }),
+      showProducts && products[0]?.displayReason
+        ? jsx('span', {
+            style: {
+              color: 'var(--ui-text-tertiary)',
+              fontSize: '10px',
+              lineHeight: 1.35
+            },
+            children: products[0].displayReason
+          })
+        : null,
+      showEvidence
+        ? jsx(HorizontalVisionCarousel, {
+            label: 'Produit attendu et preuves reçues',
+            slides: evidenceSlides,
+            renderSlide: slide =>
+              jsx(VisionEvidenceSlide, {
+                ctx,
+                payload,
+                slide,
+                key: slide.id
+              })
+          })
+        : showProducts
+          ? jsx(HorizontalVisionCarousel, {
+              label: 'Produits du dossier',
+              slides: products.slice(0, VISION_PRODUCT_LIMIT),
+              renderSlide: card =>
+                jsx(VisionProductSlide, {
+                  ctx,
+                  card,
+                  key: `${card.productRef}:${card.orderItemRef}`
+                })
+            })
+          : null,
+      visibility.hidden && canRenderProducts
+        ? jsx('span', {
+            role: 'status',
+            style: {
+              color: 'var(--ui-text-tertiary)',
+              fontSize: '10px'
+            },
+            children:
+              'Les produits sont masqués pour ce dossier dans cette session.'
+          })
+        : null,
+      jsx(VisionAttachmentsBlock, { ctx, payload }),
+      jsx(VisionConformityBlock, { payload })
+    ]
+  })
+}
+
+function VisionNotificationThumbnail({ ctx, value, notificationId }) {
+  const payload = useMemo(
+    () => parseVisionUiPayload(value),
+    [value]
+  )
+  const visibility = useVisionProductVisibility(
+    ctx,
+    payload,
+    'NOTIFICATION'
+  )
+  const product = visibleVisionProducts(payload)[0]
+  if (
+    !payload ||
+    !product ||
+    visibility.hidden ||
+    visibility.duplicate
+  ) {
+    return null
+  }
+  return jsxs('aside', {
+    'aria-label': 'Produit principal du dossier',
+    style: {
+      display: 'grid',
+      gridTemplateColumns: '48px minmax(0, 1fr) auto',
+      alignItems: 'center',
+      gap: '8px',
+      padding: '7px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '9px',
+      background: 'var(--ui-bg-primary)'
+    },
+    children: [
+      jsx(VisionStyleRules, {}),
+      jsx(VisionImage, {
+        src: product.imageUrl,
+        alt: product.imageAlt,
+        width: 96,
+        height: 96,
+        square: true
+      }),
+      jsxs('div', {
+        style: { display: 'grid', gap: '2px', minWidth: 0 },
+        children: [
+          jsx('span', {
+            style: {
+              color: 'var(--ui-text-tertiary)',
+              fontSize: '9px',
+              fontWeight: 750,
+              letterSpacing: '0.05em',
+              textTransform: 'uppercase'
+            },
+            children: 'Produit lié au dossier'
+          }),
+          product.productUrl
+            ? jsx('button', {
+                type: 'button',
+                className:
+                  'oblist-vision-focus oblist-vision-pressable',
+                onClick: () =>
+                  openVisionUrl(ctx, product.productUrl),
+                style: {
+                  overflow: 'hidden',
+                  border: 0,
+                  padding: 0,
+                  background: 'transparent',
+                  color: 'var(--ui-text-primary)',
+                  cursor: 'pointer',
+                  font: 'inherit',
+                  fontSize: '11px',
+                  fontWeight: 700,
+                  textAlign: 'left',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap'
+                },
+                children: product.title
+              })
+            : jsx('strong', {
+                style: {
+                  overflow: 'hidden',
+                  fontSize: '11px',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap'
+                },
+                children: product.title
+              }),
+          jsx('span', {
+            style: {
+              overflow: 'hidden',
+              color: 'var(--ui-text-tertiary)',
+              fontSize: '9px',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap'
+            },
+            children: `${product.vendorName}${
+              product.variantTitle
+                ? ` · ${product.variantTitle}`
+                : ''
+            }`
+          })
+        ]
+      }),
+      jsx(VisionProductsControl, {
+        hidden: false,
+        onToggle: visibility.toggleHidden,
+        hasProducts: Boolean(notificationId)
+      })
+    ]
+  })
+}
+
+function VisionDirective({
+  ctx,
+  attrs,
+  structuredContent,
+  streaming
+}) {
+  const directive = useMemo(
+    () => parseVisionDirectiveAttrs(attrs),
+    [attrs?.caseRef, attrs?.payloadRef]
+  )
+  const directiveKey = directive
+    ? `${directive.payloadRef}:${directive.caseRef}`
+    : ''
+  const directPayload = useMemo(
+    () =>
+      directive
+        ? parseVisionUiPayload(structuredContent, directive)
+        : null,
+    [directiveKey, structuredContent]
+  )
+  const [requestState, setRequestState] = useState({
+    key: '',
+    state: 'idle',
+    payload: null
+  })
+  const [retryVersion, setRetryVersion] = useState(0)
+
+  useEffect(() => {
+    if (!directive) return undefined
+    if (directPayload) {
+      cacheVisionPayload(directive, directPayload)
+      setRequestState({
+        key: directiveKey,
+        state: 'ready',
+        payload: directPayload
+      })
+      return undefined
+    }
+    if (streaming) {
+      setRequestState({
+        key: directiveKey,
+        state: 'loading',
+        payload: null
+      })
+      return undefined
+    }
+
+    const controller = new AbortController()
+    let mounted = true
+    setRequestState({
+      key: directiveKey,
+      state: 'loading',
+      payload: null
+    })
+    void resolveVisionDirectivePayload(
+      ctx,
+      directive,
+      null,
+      {
+        force: retryVersion > 0,
+        signal: controller.signal
+      }
+    )
+      .then(result => {
+        if (!mounted) return
+        setRequestState({
+          key: directiveKey,
+          state: 'ready',
+          payload: result.payload
+        })
+      })
+      .catch(error => {
+        if (!mounted) return
+        const errorKind = classifyVisionRequestError(error)
+        if (errorKind === 'ABORTED') return
+        setRequestState({
+          key: directiveKey,
+          state:
+            errorKind === 'EXPIRED' ? 'expired' : 'failed',
+          payload: null
+        })
+      })
+    return () => {
+      mounted = false
+      controller.abort()
+    }
+  }, [
+    ctx,
+    directPayload,
+    directive,
+    directiveKey,
+    retryVersion,
+    streaming
+  ])
+
+  if (!directive) return null
+  const currentState =
+    requestState.key === directiveKey
+      ? requestState
+      : { state: 'loading', payload: null }
+  const effectivePayload = directPayload || currentState.payload
+  if (effectivePayload) {
+    return jsx(VisionContextBlock, {
+      ctx,
+      value: effectivePayload,
+      surface: 'SESSION',
+      expectations: directive
+    })
+  }
+  if (
+    streaming ||
+    ['idle', 'loading'].includes(currentState.state)
+  ) {
+    return jsx('div', {
+      role: 'status',
+      'aria-live': 'polite',
+      style: {
+        width: 'min(760px, 100%)',
+        padding: '9px 10px',
+        border: '1px solid var(--ui-stroke-secondary)',
+        borderRadius: '9px',
+        color: 'var(--ui-text-tertiary)',
+        fontSize: '11px'
+      },
+      children: 'Chargement sécurisé du contexte visuel…'
+    })
+  }
+  return jsxs('div', {
+    role: 'alert',
+    style: {
+      width: 'min(760px, 100%)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: '9px',
+      padding: '9px 10px',
+      border: '1px solid var(--ui-stroke-secondary)',
+      borderRadius: '9px',
+      color: 'var(--ui-text-secondary)',
+      fontSize: '11px'
+    },
+    children: [
+      jsx('span', {
+        children:
+          currentState.state === 'expired'
+            ? 'Ce contexte visuel a expiré ou n’est plus disponible.'
+            : 'Le contexte visuel n’a pas pu être chargé.'
+      }),
+      jsx(Button, {
+        size: 'sm',
+        variant: 'secondary',
+        onClick: () => {
+          visionPayloadCache.delete(
+            visionPayloadCacheKey(directive)
+          )
+          setRetryVersion(value => value + 1)
+        },
+        children: 'Réessayer'
+      })
+    ]
+  })
+}
+
 function useReservationCountdown(expiresAt) {
   const reducedMotion = usePrefersReducedMotion()
   const [now, setNow] = useState(Date.now())
@@ -2984,6 +6158,11 @@ function OperationsOverview({
                           children: situation.nextAction
                         })
                       : null,
+                    jsx(VisionContextBlock, {
+                      ctx,
+                      value: situation.visionUi,
+                      surface: 'OVERVIEW'
+                    }),
                     jsx(WorkflowPanel, {
                       ctx,
                       runtime,
@@ -3996,6 +7175,11 @@ function NotificationInboxPage({ ctx }) {
                           accent: true
                         }
                       ),
+                      jsx(VisionNotificationThumbnail, {
+                        ctx,
+                        value: notification?.payload?.visionUi,
+                        notificationId: notification.id
+                      }),
                       jsx(WorkflowPanel, {
                         ctx,
                         runtime,
@@ -4231,6 +7415,24 @@ export default {
           jsx(ActionCard, {
             ctx,
             actionId: attrs.id || '',
+            streaming
+          })
+      }
+    })
+    ctx.register({
+      id: 'oblist-vision-directive',
+      area: TRANSCRIPT_DIRECTIVE_AREA,
+      data: {
+        name: VISION_DIRECTIVE_NAME,
+        render: ({
+          attrs,
+          structuredContent,
+          streaming
+        }) =>
+          jsx(VisionDirective, {
+            ctx,
+            attrs,
+            structuredContent,
             streaming
           })
       }
