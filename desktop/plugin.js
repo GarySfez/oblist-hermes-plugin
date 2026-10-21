@@ -74,7 +74,7 @@ const visionAttachmentLinkCache = new Map()
 const visionAttachmentLinkRequests = new Map()
 
 const PLUGIN_VERSION = '0.5.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.21.13'
+const PLUGIN_RELEASE_REVISION = '2026.10.21.14'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
   'https://garysfez.github.io/oblist-hermes-plugin/?update=1&desktop=1'
@@ -6552,10 +6552,34 @@ async function resolveNotificationNow(
 ) {
   const situation = notification?.payload?.situation
   const watchId = notification?.payload?.watchId
-  if (!situation?.id || !UUID_RE.test(watchId || '')) {
+  if (!situation?.id) {
     throw new Error('INVALID_NOTIFICATION_CASE')
   }
   const { operator } = currentNotificationScope()
+  if (!UUID_RE.test(watchId || '')) {
+    const opened = await openSituationChat(
+      situation,
+      operator || profile || undefined,
+      {
+        presentation: notification?.payload?.presentation,
+        requestedBy: notification?.payload?.requestedBy,
+        manualRequest:
+          notification?.payload?.manualRequest === true,
+        notificationCreatedAt: notification.createdAt,
+        changeSummary: notification?.payload?.changeSummary
+      }
+    )
+    if (!opened) {
+      throw new Error('RESOLUTION_SESSION_OPEN_FAILED')
+    }
+    await readNotification(ctx, notification.id)
+    host.notify({
+      kind: 'success',
+      message:
+        'Session de résolution ouverte ; cette ancienne alerte ne modifie pas l’assignation'
+    })
+    return true
+  }
   const claimed = await claimNotificationWatch(ctx, notification)
   const claim = claimed?.claim
   if (
