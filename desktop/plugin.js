@@ -74,7 +74,7 @@ const visionAttachmentLinkCache = new Map()
 const visionAttachmentLinkRequests = new Map()
 
 const PLUGIN_VERSION = '0.5.0'
-const PLUGIN_RELEASE_REVISION = '2026.10.21.12'
+const PLUGIN_RELEASE_REVISION = '2026.10.21.13'
 const RELEASE_EPOCH = 'hermes-intelligence-v2'
 const MANAGED_PLUGIN_INSTALLER_URL =
   'https://garysfez.github.io/oblist-hermes-plugin/?update=1&desktop=1'
@@ -7019,7 +7019,7 @@ function NotificationInboxPage({ ctx }) {
                   notifications.length > 1 ? 's' : ''
                 } · ${inboxViewLabel(view)} · ${
                   operator || 'Vue globale de Gary'
-                }`
+                } · Interface ${PLUGIN_RELEASE_REVISION}`
               })
             ]
           }),

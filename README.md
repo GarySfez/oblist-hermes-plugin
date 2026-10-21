@@ -37,6 +37,10 @@ One-click Desktop installer:
 https://garysfez.github.io/oblist-hermes-plugin/
 ```
 
+The default button uses Hermes' `plugin-desktop` protocol so it updates the
+local Desktop bundle. Agent/Gateway installation is available explicitly with
+`?agent=1`; the two destinations must never be conflated.
+
 The public distribution repository contains plugin code only. It contains no
 credentials, customer data, Kepler data or direct third-party access.
 

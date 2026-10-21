@@ -96,7 +96,7 @@
       <a
         id="install"
         class="button"
-        href="hermes://plugin/install?repo=GarySfez/oblist-hermes-plugin&amp;enable=1&amp;force=1"
+        href="hermes://plugin-desktop/install?repo=GarySfez/oblist-hermes-plugin&amp;enable=1&amp;force=1"
       >
         Install or update Hermes Desktop
       </a>
@@ -108,9 +108,9 @@
     <script>
       const install = document.getElementById("install");
       const query = new URLSearchParams(window.location.search);
-      if (install && query.get("desktop") === "1") {
+      if (install && query.get("agent") === "1") {
         install.href =
-          "hermes://plugin-desktop/install?repo=GarySfez/oblist-hermes-plugin&enable=1&force=1";
+          "hermes://plugin/install?repo=GarySfez/oblist-hermes-plugin&enable=1&force=1";
       }
       if (install && query.get("update") === "1") {
         window.location.replace(install.href);
