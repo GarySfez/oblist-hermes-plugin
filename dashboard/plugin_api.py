@@ -43,6 +43,10 @@ _PREFLIGHT_CACHE: dict[
     tuple[str, str, str],
     tuple[float, int, bool],
 ] = {}
+_SERVER_DIGEST_CACHE: dict[
+    tuple[str, str, str],
+    tuple[float, str],
+] = {}
 _PLUGIN_VERSION = "0.5.0"
 _RELEASE_EPOCH = "hermes-intelligence-v2"
 _MANAGED_PLUGIN_REPOSITORY = "GarySfez/oblist-hermes-plugin"
@@ -158,6 +162,71 @@ def _release_headers(contract: dict, release_epoch: int | None = None) -> dict:
     if release_epoch is not None:
         headers["X-Hermes-Release-Epoch"] = str(release_epoch)
     return headers
+
+
+def _server_bound_contract(
+    base_url: str,
+    token: str,
+    contract: dict,
+) -> dict:
+    if isinstance(contract.get("manifestDigest"), str):
+        return contract
+    version_key = "|".join(
+        str(contract.get(key, ""))
+        for key in (
+            "releaseVersion",
+            "contractVersion",
+            "schemaVersion",
+            "memoryApiVersion",
+            "workerVersion",
+            "pluginVersion",
+        )
+    )
+    cache_key = (base_url, token, version_key)
+    cached = _SERVER_DIGEST_CACHE.get(cache_key)
+    if cached and cached[0] > time.monotonic():
+        return {**contract, "manifestDigest": cached[1]}
+    request = urllib.request.Request(
+        f"{base_url}/v1/release/handshake",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            **_release_headers(contract),
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as error:
+        raise RuntimeError(
+            "Server-bound release contract is unavailable"
+        ) from error
+    versions = payload.get("versions") if isinstance(payload, dict) else None
+    expected = {
+        key: contract[key]
+        for key in (
+            "releaseVersion",
+            "contractVersion",
+            "schemaVersion",
+            "memoryApiVersion",
+            "workerVersion",
+            "pluginVersion",
+        )
+    }
+    digest = payload.get("manifestDigest") if isinstance(payload, dict) else None
+    if (
+        not isinstance(versions, dict)
+        or any(versions.get(key) != value for key, value in expected.items())
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"sha256:[a-f0-9]{64}", digest)
+    ):
+        raise RuntimeError("Server-bound release contract is invalid")
+    _SERVER_DIGEST_CACHE[cache_key] = (
+        time.monotonic() + 60,
+        digest,
+    )
+    return {**contract, "manifestDigest": digest}
 
 
 def _release_preflight(
@@ -358,12 +427,45 @@ def _require_oblist_operator(request: Request) -> str:
     return operator
 
 
+def _resolved_secret(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    try:
+        from agent.secret_scope import get_secret
+    except Exception:
+        return ""
+    for name in names:
+        try:
+            value = str(get_secret(name, "") or "").strip()
+        except Exception:
+            value = ""
+        if value:
+            return value
+    return ""
+
+
+def _dotenv_secret(path: Path, *names: str) -> str:
+    if not path.is_file():
+        return ""
+    expected = set(names)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for raw_line in lines:
+        key, separator, value = raw_line.partition("=")
+        if separator and key.strip() in expected and value.strip():
+            return value.strip()
+    return ""
+
+
 def _profile_action_token(operator: str) -> str:
     if operator in {"lyse", "philippine"}:
-        explicit = os.environ.get(
+        explicit = _resolved_secret(
             f"OBLIST_{operator.upper()}_ACTION_CARD_TOKEN",
-            "",
-        ).strip()
+        )
         if explicit:
             return explicit
         home_root = _MANAGED_PLUGIN_ROOT.parent.parent
@@ -373,25 +475,35 @@ def _profile_action_token(operator: str) -> str:
             and home_root.parent.name == "profiles"
             else home_root / "profiles"
         )
-        profile_env = profiles_root / operator / ".env"
-        if profile_env.is_file():
-            for raw_line in profile_env.read_text(
-                encoding="utf-8",
-            ).splitlines():
-                key, separator, value = raw_line.partition("=")
-                if (
-                    separator
-                    and key.strip() == "OBLIST_ACTION_MCP_TOKEN"
-                    and value.strip()
-                ):
-                    return value.strip()
+        profile_token = _dotenv_secret(
+            profiles_root / operator / ".env",
+            "OBLIST_ACTION_MCP_TOKEN",
+            "MCP_OBLIST_ACTIONS_API_KEY",
+        )
+        if profile_token:
+            return profile_token
+        scoped_secret = _resolved_secret(
+            "OBLIST_ACTION_MCP_TOKEN",
+            "MCP_OBLIST_ACTIONS_API_KEY",
+        )
+        if scoped_secret:
+            return scoped_secret
         raise RuntimeError(
             f"No scoped action-card token is configured for {operator}"
         )
-    return (
-        os.environ.get("OBLIST_ACTION_CARD_REVIEW_TOKEN", "")
-        or os.environ.get("MCP_OBLIST_ACTIONS_API_KEY", "")
-    ).strip()
+    token = _resolved_secret(
+        "OBLIST_ACTION_CARD_REVIEW_TOKEN",
+        "MCP_OBLIST_ACTIONS_API_KEY",
+        "OBLIST_ACTION_MCP_TOKEN",
+    )
+    if token:
+        return token
+    return _dotenv_secret(
+        _MANAGED_PLUGIN_ROOT.parent.parent / ".env",
+        "OBLIST_ACTION_CARD_REVIEW_TOKEN",
+        "MCP_OBLIST_ACTIONS_API_KEY",
+        "OBLIST_ACTION_MCP_TOKEN",
+    )
 
 
 def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) -> dict:
@@ -402,7 +514,11 @@ def _request_ai_ops(path: str, method: str = "GET", body: dict | None = None) ->
     token = _profile_action_token(_REQUEST_OPERATOR_SCOPE.get())
     if not token:
         raise RuntimeError("No action-card gateway token is configured")
-    contract = _release_contract()
+    contract = _server_bound_contract(
+        base_url,
+        token,
+        _release_contract(),
+    )
     force_preflight = (
         path.endswith("/execute")
         or path.endswith("/claim/confirm")
@@ -1261,7 +1377,7 @@ async def get_notifications(request: Request):
         f"{_api_path('notifications')}?{query}",
     )
     if isinstance(result, dict):
-        result["operatorRef"] = operator or None
+        result.setdefault("operatorRef", operator or None)
     return result
 
 
@@ -1300,7 +1416,7 @@ async def get_notification_inbox(request: Request):
         f"{_api_path('notification_inbox')}?{query}",
     )
     if isinstance(result, dict):
-        result["operatorRef"] = operator or None
+        result.setdefault("operatorRef", operator or None)
     return result
 
 
